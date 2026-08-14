@@ -1,0 +1,14 @@
+button|总时长: ${p_1}分钟|/opt/usr/nx-ks/ramp/set_duration.sh
+button|间隔: ${p_2}秒|/opt/usr/nx-ks/ramp/set_time-gap.sh
+
+button|曝光起点: ${p_3}|/opt/usr/nx-ks/ramp/set_exp_start.sh
+button|曝光终点: ${p_4}|/opt/usr/nx-ks/ramp/set_exp_end.sh
+
+button|渐变开始: ${p_5}分钟|/opt/usr/nx-ks/ramp/set_ramp_start.sh
+button|渐变时长: ${p_6}分钟|/opt/usr/nx-ks/ramp/set_ramp_length.sh
+
+button|延时启动: ${p_7}分钟|/opt/usr/nx-ks/ramp/set_delay_start.sh
+button|返回|@/opt/usr/nx-ks/gui_tl.NX${p}
+
+button|取消|/opt/usr/nx-ks/gui_exit.sh
+button|开始|/opt/usr/nx-ks/ramping.sh

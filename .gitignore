@@ -1,0 +1,30 @@
+# ===== 预编译库 / 二进制（非源码） =====
+*.so
+*.so.*
+telnetd
+
+# ===== 字体（二进制资源） =====
+*.woff
+*.woff2
+*.ttf
+*.eot
+
+# ===== 媒体资源（非源码） =====
+*.jpg
+*.JPG
+*.jpeg
+*.png
+*.gif
+*.mp4
+*.MP4
+*.webm
+
+# ===== 备份与内部目录 =====
+backup_original/
+.uploads/
+.workbuddy/
+
+# ===== 编辑器 / 系统 =====
+.DS_Store
+Thumbs.db
+*.swp

@@ -1,0 +1,11 @@
+button|对焦堆栈|/opt/usr/nx-ks/fstack.sh
+button|对焦按钮|/opt/usr/nx-ks/focus_buttons
+
+button|配置文件|@/opt/usr/nx-ks/gui_profiles.NX500
+button|对焦速度|/opt/usr/nx-ks/fpspeed.sh
+
+checkbox|自定义选项|cCheckbox.sh
+button|自定义按钮|cButton.sh
+
+button|返回|@/opt/usr/nx-ks/gui_ini.NX500
+button|取消|/opt/usr/nx-ks/gui_exit.sh

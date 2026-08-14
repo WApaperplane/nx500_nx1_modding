@@ -1,0 +1,14 @@
+checkbox|远程保存|rem.sh
+button|视频码率|@/tmp/gui_br.NX500
+
+button|变焦缩放|zoomzoom.sh
+button|分辨率修改|@/opt/usr/nx-ks/gui_res.NX500
+
+button|批量录制|brec.sh
+button|HDR|1HDR.sh
+
+button| 版本 v2.88 |ver.sh
+checkbox|摄像模式|camcorder_mode.sh
+
+button|返回|@/opt/usr/nx-ks/gui_ini.NX500
+button|取消|/opt/usr/nx-ks/gui_exit.sh
