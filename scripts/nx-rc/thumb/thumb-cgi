@@ -1,0 +1,180 @@
+#!/bin/sh
+# ============================================================
+# thumb-cgi - NX 相机相册缩略图生成 CGI(busybox httpd)
+#
+# 解决 web 相册"缩略图直接引用原图"导致的内存/带宽问题:
+#   前端不再加载 4-8MB 原图,而是请求本端点获取 15-30KB 缩略图。
+#
+# 依赖(NX-KS 完整包已内置):
+#   /opt/usr/nx-ks/tools/usr/bin/convert   (ImageMagick 6, ARM)
+#   /opt/usr/nx-ks/tools/usr/lib           (convert 运行库)
+#
+# 访问:
+#   GET /cgi-bin/thumb?f=<DCIM相对路径>&w=<宽>&q=<质量>
+#   例: /cgi-bin/thumb?f=100PHOTO/IMG_0001.JPG&w=400&q=82
+#
+# 缓存:
+#   SD 卡 .thumbcache/<宽>x<质量>/<原路径>.jpg
+#   源文件 mtime 更新后自动重建。
+#
+# 部署(相机端,需 NX-KS root):
+#   拷贝本文件到 /opt/usr/nx-ks/capdtm/www/cgi-bin/thumb 并 chmod +x,
+#   确保 capdtm-httpd.sh 已启动(8080 端口 busybox httpd)。
+# ============================================================
+
+# ---- 工具路径(NX-KS 固定布局) ----
+TOOLS=/opt/usr/nx-ks/tools
+CONVERT=$TOOLS/usr/bin/convert
+LD_LIBRARY_PATH=$TOOLS/usr/lib
+export LD_LIBRARY_PATH
+
+# ---- 定位 SD 卡(DCIM 所在挂载点,依次探测) ----
+SD=""
+for cand in /mnt/mmc /tmp/mmc /mnt/sd /tmp/sd; do
+    if [ -d "$cand/DCIM" ]; then
+        SD=$cand
+        break
+    fi
+done
+
+# ---- URL 解码(%XX -> 字节;busybox httpd 可能已解码,无 % 则原样) ----
+urldecode() {
+    case "$1" in
+        *%*) printf '%b' "$(printf '%s' "$1" | sed 's/%/\\x/g')" ;;
+        *)   printf '%s' "$1" ;;
+    esac
+}
+
+# ---- 参数解析 ----
+QS=${QUERY_STRING:-}
+F=""
+W=400
+Q=82
+IFS='&'
+for pair in $QS; do
+    [ -z "$pair" ] && continue
+    key=${pair%%=*}
+    val=${pair#*=}
+    case "$key" in
+        f) F=$(urldecode "$val") ;;
+        w) W=$val ;;
+        q) Q=$val ;;
+    esac
+done
+unset IFS
+
+# ---- 参数校验 ----
+case "$W" in
+    ''|*[!0-9]*) W=400 ;;
+esac
+case "$Q" in
+    ''|*[!0-9]*) Q=82 ;;
+esac
+[ "$W" -lt 64 ] && W=64
+[ "$W" -gt 1024 ] && W=1024
+[ "$Q" -lt 50 ] && Q=50
+[ "$Q" -gt 95 ] && Q=95
+
+fail() {
+    echo "Content-Type: text/plain; charset=utf-8"
+    echo "Cache-Control: no-store"
+    echo ""
+    echo "thumb error: $1"
+    exit 0
+}
+
+# ---- 前置检查 ----
+[ -z "$SD" ] && fail "SD card not found"
+[ -x "$CONVERT" ] || fail "convert not found"
+[ -n "$F" ] && [ "$F" != "/" ] || fail "missing f parameter"
+
+# ---- 路径安全:仅允许 DCIM 下的相对路径 ----
+F=$(printf '%s' "$F" | sed 's#^/*##; s#/*$##')
+case "$F" in
+    *".."*|*"//"*|*"\\"*) fail "invalid path" ;;
+esac
+# 容忍前端传 DCIM/ 前缀
+case "$F" in
+    DCIM/*) F=${F#DCIM/} ;;
+esac
+[ -n "$F" ] || fail "invalid path"
+
+# 扩展名白名单(仅图片)
+EXT=$(printf '%s' "$F" | sed 's/.*\.//' | tr 'A-Z' 'a-z')
+case "$EXT" in
+    jpg|jpeg|png|gif|bmp|tif|tiff) ;;
+    *) fail "unsupported type: .$EXT" ;;
+esac
+
+SRC="$SD/DCIM/$F"
+[ -f "$SRC" ] || fail "source not found"
+
+# ---- 缓存(.thumbcache/<w>x<q>/<原路径>.jpg) ----
+CACHE_ROOT="$SD/.thumbcache/${W}x${Q}"
+CACHE="$CACHE_ROOT/$F.jpg"
+LOCK="$CACHE.lock"
+
+# nice 可用则降低优先级:convert 是 CPU 密集任务,若不降权会打满相机
+# 单核 CPU,导致 80 端口 daemon 的 status 心跳超时,前端误报"已断开连接"。
+NICE=""
+if command -v nice >/dev/null 2>&1; then
+    NICE="nice -n 19"
+fi
+
+if [ -f "$CACHE" ] && [ ! "$SRC" -nt "$CACHE" ]; then
+    CACHE_STALE=0
+else
+    CACHE_STALE=1
+fi
+
+if [ "$CACHE_STALE" = "1" ]; then
+    # ---- 并发保护:同一张图只让一个进程生成,其余等待后直接读缓存 ----
+    # 前端限流后重复概率已很低,但预热脚本与浏览请求仍可能撞同一张,
+    # 若不加锁会重复跑两次 convert(相机上约 0.5-2s/张,浪费且加剧卡顿)。
+    waited=0
+    while ! mkdir "$LOCK" 2>/dev/null; do
+        # 别人已生成完:直接用
+        if [ -f "$CACHE" ] && [ ! "$SRC" -nt "$CACHE" ]; then
+            CACHE_STALE=0
+            break
+        fi
+        waited=$((waited + 1))
+        if [ "$waited" -ge 40 ]; then
+            # 等待超时,判定为僵死锁,强制接管
+            rmdir "$LOCK" 2>/dev/null
+            break
+        fi
+        sleep 1
+    done
+fi
+
+if [ "$CACHE_STALE" = "1" ]; then
+    mkdir -p "$(dirname "$CACHE")" 2>/dev/null || { rmdir "$LOCK" 2>/dev/null; fail "cache dir failed"; }
+    TMP="$CACHE.tmp.$$"
+    rm -f "$TMP"
+    # jpeg:size 触发 libjpeg DCT 快速缩放,不解码全图(28MP 内存占用可忽略)
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 30 $NICE "$CONVERT" -define "jpeg:size=${W}x${W}" \
+            -auto-orient -thumbnail "${W}x${W}" -quality "$Q" \
+            "$SRC" "$TMP" 2>/dev/null
+    else
+        $NICE "$CONVERT" -define "jpeg:size=${W}x${W}" \
+            -auto-orient -thumbnail "${W}x${W}" -quality "$Q" \
+            "$SRC" "$TMP" 2>/dev/null
+    fi
+    rmdir "$LOCK" 2>/dev/null
+    if [ -s "$TMP" ]; then
+        mv -f "$TMP" "$CACHE" 2>/dev/null || { rm -f "$TMP"; fail "cache write failed"; }
+    else
+        rm -f "$TMP"
+        fail "convert failed"
+    fi
+fi
+
+# ---- 输出 ----
+echo "Content-Type: image/jpeg"
+echo "Cache-Control: public, max-age=86400"
+echo ""
+cat "$CACHE"
+
+exit 0

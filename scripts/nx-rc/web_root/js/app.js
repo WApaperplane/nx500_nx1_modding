@@ -31,6 +31,16 @@ App.prototype.init = function () {
 
     $('.nav-tabs a').on('shown.bs.tab', function (event) {
         self.activeTab = $(event.target).attr('href');
+
+        // 页签切换后立即按新间隔重排心跳:
+        // 相册页降频,避免与缩略图请求争抢相机端资源导致"假断开"。
+        var h;
+        for (h in self.controllers) {
+            if (self.controllers[h].scheduleStatus) {
+                self.controllers[h].scheduleStatus();
+            }
+        }
+
         if (self.activeTab != '#controller') {
             var hostname;
             for (hostname in self.controllers) {

@@ -1,7 +1,22 @@
+/* ------------------------------------------------------------
+ * 连接心跳参数
+ *
+ * 背景:WiFi 直连 + 相机单核 CPU 下,相册页并发拉取几十张缩略图会
+ * 让相机端 ImageMagick 进程打满 CPU,导致 80 端口 daemon 的 status
+ * 请求排队超时。旧逻辑"单次失败立刻弹断开弹窗"因此频繁假阳性
+ * (表现为:弹窗说已断开,但点掉后图片照常加载)。
+ *
+ * 对策:连续失败累计到阈值才判定真断开;超时放宽;相册页降频。
+ * ------------------------------------------------------------ */
+NxRemoteController.STATUS_TIMEOUT = 8000;   // 单次请求超时(ms)
+NxRemoteController.STATUS_INTERVAL = 1500;  // 控制页心跳间隔(ms)
+NxRemoteController.STATUS_INTERVAL_GALLERY = 6000; // 相册页心跳间隔(ms)
+NxRemoteController.FAIL_THRESHOLD = 3;      // 连续失败多少次才判定断开
+
 function NxRemoteController(hostname) {
     this.hostname = hostname;
     this.viewFinder = null;
-    this.urlPrefix = 'http://' + hostname; 
+    this.urlPrefix = 'http://' + hostname;
     this.nxModelName = "NX1"; // FIXME: fallback
     this.nxFwVer = "";
     this.macAddress = "";
@@ -11,6 +26,9 @@ function NxRemoteController(hostname) {
     this.mouseInput = null;
     this.statusTimer = null;
     this.settings = null;
+    this.failCount = 0;    // 连续失败计数(成功即清零)
+    this.warnShown = false;  // 轻量提示条是否已显示
+    this.destroyed = false;  // 已销毁则停止心跳
 
     this.init();
 }
@@ -68,9 +86,9 @@ NxRemoteController.prototype.getCameraInfo = function () {
 
             self.setVisibility();
             self.controlLcd('on');
-            self.statusTimer = setInterval(function () {
-                self.getCameraStatus();
-            }, 1000);
+            // 用可变的 setTimeout 递归替代固定 setInterval:
+            // 相册页需要拉长间隔,避免与缩略图请求争抢相机端资源。
+            self.scheduleStatus();
 
             app.controlPanel.updateTitle();
             app.controlPanel.setVisibility();
@@ -113,11 +131,49 @@ NxRemoteController.prototype.restartScreen = function () {
     }
 }
 
+/* 调度下一次心跳(间隔随当前页签变化) */
+NxRemoteController.prototype.scheduleStatus = function () {
+    var self = this;
+    if (self.statusTimer != null) {
+        clearTimeout(self.statusTimer);
+        self.statusTimer = null;
+    }
+    // 相册页会并发拉取大量缩略图,心跳降频,避免被饿死产生假阳性
+    var gallery = (typeof app !== 'undefined' && app &&
+                   app.getActiveTab && app.getActiveTab() == '#gallery');
+    var interval = gallery ? NxRemoteController.STATUS_INTERVAL_GALLERY
+                           : NxRemoteController.STATUS_INTERVAL;
+    self.statusTimer = setTimeout(function () {
+        self.statusTimer = null;
+        self.getCameraStatus();
+    }, interval);
+};
+
+/* 轻量连接提示条(非阻塞);仅在真正判定断开前出现 */
+NxRemoteController.prototype.showConnWarning = function (show, text) {
+    var $w = $('#connWarning');
+    if ($w.length == 0) {
+        $w = $('<div id="connWarning"></div>').appendTo('body');
+    }
+    if (show) {
+        $w.html('<i class="fa fa-exclamation-triangle"></i> ' + text)
+          .addClass('show');
+        this.warnShown = true;
+    } else {
+        $w.removeClass('show');
+        this.warnShown = false;
+    }
+};
+
 NxRemoteController.prototype.getCameraStatus = function () {
     var self = this;
+    // Tab 页被浏览器挂起/已销毁时不发请求
+    if (self.destroyed) {
+        return;
+    }
     $.ajax({
         url: self.createUrl('/api/v1/camera/status'),
-        timeout: 3000,
+        timeout: NxRemoteController.STATUS_TIMEOUT,
         success: function(status) {
             var title = $('<span></span>')
                 .click(function () {
@@ -207,12 +263,31 @@ NxRemoteController.prototype.getCameraStatus = function () {
                     status.cameras[i].packet.split('|')[4];
                 app.setCameras(status.cameras);
             }
+            self.failCount = 0;
+            if (self.warnShown) {
+                self.showConnWarning(false);
+            }
             if (self.modalEnabled == true) {
                 $('#disconnectedModal').modal('hide');
                 self.modalEnabled = false;
             }
         },
         error: function (request, status, error) {
+            if (self.destroyed) {
+                return;
+            }
+            self.failCount++;
+
+            // 未达阈值:只显示轻量提示条,不做任何阻塞/清理。
+            // 相册页浏览时相机 CPU 被缩略图生成占满是常态,
+            // 此时 status 超时不代表断开(图片仍在正常加载)。
+            if (self.failCount < NxRemoteController.FAIL_THRESHOLD) {
+                self.showConnWarning(true,
+                    '相机响应缓慢,正在重试…(' + self.failCount + '/' +
+                    NxRemoteController.FAIL_THRESHOLD + ')');
+                return;
+            }
+
             if (self.modalEnabled == false) {
                 var hostname;
                 var found = false;
@@ -230,6 +305,7 @@ NxRemoteController.prototype.getCameraStatus = function () {
                 if (name == '') {
                     name = self.hostname;
                 }
+                self.showConnWarning(false);
                 $('#disconnectedModalBody')
                     .html($('<p></p>').append(name + ' 已断开连接。'));
                 $('#disconnectedModal').modal('show');
@@ -242,6 +318,10 @@ NxRemoteController.prototype.getCameraStatus = function () {
                     }
                 }, 5000); // wait 5 second;
             }
+        },
+        complete: function () {
+            // 无论成功失败都继续心跳(到达阈值的分支会自行销毁)
+            self.scheduleStatus();
         }
     });
 }
@@ -305,15 +385,21 @@ NxRemoteController.prototype.stopScreen = function () {
 }
 
 NxRemoteController.prototype.destroy = function () {
-    this.osd.destroy();
-    this.osd = null;
-    this.liveView.destroy();
-    this.liveView = null;
+    this.destroyed = true;
+    if (this.osd != null) {
+        this.osd.destroy();
+        this.osd = null;
+    }
+    if (this.liveView != null) {
+        this.liveView.destroy();
+        this.liveView = null;
+    }
     this.mouseInput = null;
     if (this.statusTimer != null) {
-        clearInterval(this.statusTimer);
+        clearTimeout(this.statusTimer);
         this.statusTimer = null;
     }
+    this.showConnWarning(false);
     if (this.viewFinder != null) {
         this.viewFinder.destroy();
         this.viewFinder = null;
