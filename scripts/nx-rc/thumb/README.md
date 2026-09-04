@@ -114,9 +114,12 @@ curl "http://<相机IP>:8080/cgi-bin/thumb?f=100PHOTO/IMG_0001.JPG&w=400&q=82" -
 
 1. 相机开启 WiFi，浏览器访问 `http://<相机IP>/`
 2. 顶部导航切到「相册」
-3. 预期：
-   - 缩略图快速出现（每张 15–30KB；首次访问逐张生成，0.5–2s/张，之后秒开）
-   - 滚动到底自动加载下一批（每批 30 张），直至「已加载全部 N 个文件」
+3. 预期（折叠目录模型，2026-09 起）：
+   - **目录倒序**列出（`299PHOTO`…`100PHOTO`，最新在上），每个目录是一个可点开的目录头
+   - **默认展开最新 1 个目录**，其照片立刻出现（最新照片在前），缩略图 15–30KB
+   - 点其他目录头才**按需加载**该目录（不点不抓，目录再多也不拖慢首屏）
+   - 再点已展开目录头可收起（收起即释放缩略图解码内存）
+   - 切走再切回相册页：2 分钟内**命中缓存**，不重新抓目录
    - 点击缩略图，Lightbox 以原图打开
    - 开发者工具 Network：缩略图请求全部指向 `:8080/cgi-bin/thumb`，无原图直连
 
@@ -139,14 +142,17 @@ open http://127.0.0.1:8080/    # 相册 tab 即完整缩略图流程
 
 # 4. 自动化验证(可选,需 Edge + playwright-core)
 cd test_server
-NODE_PATH=<node-workspace>/node_modules node verify-gallery.js
+NODE_PATH=<node-workspace>/node_modules node verify-dirs.js      # 折叠目录/按需加载/缓存
+NODE_PATH=<node-workspace>/node_modules node verify-stability.js # 心跳去抖/并发限流/Lightbox
 ```
 
 说明：
 - `test_server/server.py` 的 `/cgi-bin/thumb` 用 Pillow 生成缩略图，
   行为与相机端 `thumb-cgi` 一致（含 EXIF 方向处理、参数钳制、路径安全校验）
-- `verify-gallery.js` 自动检查：首批 30 张、滚动分批加载至全部、
-  缩略图 100% 走 CGI、视口内存释放、Lightbox 原图
+- `verify-dirs.js`（推荐，现行架构）自动检查：目录倒序、默认只展开最新目录
+  （10 个目录仅发 1 次目录请求）、按需点开加载、切回页签命中缓存不重抓、目录内照片最新在前
+- `verify-stability.js` 自动检查：心跳去抖不弹假断开、缩略图并发峰值 ≤ 2、Lightbox 原图
+- `verify-gallery.js` / `verify-streaming.js` 为历史版本（旧滚动分批架构），仅回滚回归用
 
 ---
 
@@ -161,6 +167,11 @@ Gallery.THUMB = {
     width: 400,      // 缩略图长边像素(网格 140px @2x DPR 足够)
     quality: 82
 };
+
+Gallery.MAX_CONCURRENT = 2;   // 缩略图并发上限(相机单核,勿调高)
+Gallery.DIR_CONCURRENCY = 3;  // 目录请求并发上限
+Gallery.DEFAULT_EXPAND = 1;   // 默认展开的"最新"目录数
+Gallery.TREE_CACHE_TTL = 120000; // 目录清单缓存时长(ms),切页签回来不重抓
 ```
 
 CGI 参数：`f`（DCIM 相对路径，必需）、`w`（64–1024，默认 400）、
@@ -184,6 +195,8 @@ CGI 参数：`f`（DCIM 相对路径，必需）、`w`（64–1024，默认 400�
 | 底部常驻「相机响应缓慢」提示 | 相机确实繁忙（预热或首次生成中） | 属正常提示，任务完成后自动消失；若长期不消失再查网络 |
 | 相机重启后缓存丢失 | —（SD 卡缓存不会丢） | 若使用 `/tmp` 才丢失；确认缓存目录在 `/mnt/mmc/.thumbcache` |
 | 页面无法滚动 | 旧 CSS 高度锁死 | 确认已更新 `style.css`（`body,html` 为 `min-height:100%; height:auto; overflow-y:auto`） |
+| 看不到老目录内容 | 折叠模型：老目录默认收起 | 点目录头（▶）展开；目录内最新照片在前，点目录头可收起 |
+| 点目录头转圈后提示读取失败 | 该目录页抓取失败（目录被占用/损坏） | 稍后再点一次重试；确认相机 daemon 可访问该目录 |
 
 ---
 

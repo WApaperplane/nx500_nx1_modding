@@ -443,13 +443,66 @@ a { color: var(--blue); }
 .gallery-toolbar .btn { margin-left: 6px; }
 
 .gallery-section { padding: 8px 8px 0 8px; }
+
+/* ---------- 目录头(折叠/展开) ---------- */
+.gallery-dir-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  margin-bottom: 6px;
+  background: var(--surface2, rgba(255,255,255,0.05));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+.gallery-dir-head:hover {
+  border-color: var(--accent, #4a9eff);
+  background: rgba(74, 158, 255, 0.08);
+}
+.gallery-dir-arrow {
+  color: var(--text-dim, #8891a0);
+  font-size: 12px;
+  width: 14px;
+  text-align: center;
+  flex: 0 0 auto;
+}
 .gallery-dir-name {
-  color: var(--accent);
+  color: var(--accent, #4a9eff);
   font-size: 14px;
-  font-weight: 500;
-  padding: 6px 4px;
+  font-weight: 600;
+  padding: 0;
   margin: 0;
   line-height: 1.5;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gallery-dir-meta {
+  color: var(--text-dim, #8891a0);
+  font-size: 12px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.gallery-dir-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(136,145,160,0.25);
+  border-top-color: var(--accent, #4a9eff);
+  border-radius: 50%;
+  display: inline-block;
+  animation: gallery-spin 0.8s linear infinite;
+}
+.gallery-dir-empty {
+  color: var(--text-dim);
+  font-size: 13px;
+  text-align: center;
+  padding: 18px 8px;
+  width: 100%;
 }
 .gallery-grid { display: flex; flex-wrap: wrap; }
 .gallery-item {

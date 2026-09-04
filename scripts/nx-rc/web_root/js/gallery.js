@@ -30,9 +30,6 @@ Gallery.THUMB = {
     quality: 82
 };
 
-/* 每批渲染的图片数量 */
-Gallery.BATCH = 30;
-
 /* 同时发起的缩略图请求上限。
  *
  * 相机端 busybox httpd 是串行 fork ImageMagick 的,单核 CPU 下一次
@@ -44,24 +41,27 @@ Gallery.BATCH = 30;
  */
 Gallery.MAX_CONCURRENT = 2;
 
-/* 目录树抓取并发数。
- *
- * 旧实现是严格串行:一个目录请求回来才发下一个,且必须等全部目录读完
- * 才开始渲染。SD 卡上有 20 个目录就是 21 次串行往返,期间用户只能看
- * 转圈——这是"相册打开慢"的另一半原因(另一半是缩略图现算)。
- *
- * 现在改为并发抓取 + 流式渲染:抓完一个目录立刻渲染一个分组,
- * 首屏几乎立刻出图,剩余目录在后台继续读。
- * 并发数仍保守取 3:daemon 并发能力有限,太猛会拖慢遥控心跳。
+/* 目录树抓取:并发上限(用户连续点开多个目录时,同时只发这么多目录请求)。
+ * 目录请求本身轻量(只取目录 HTML),不像缩略图 convert 那样吃满 CPU,
+ * 但也要节制,避免把 daemon 的 HTTP 连接池占满拖慢遥控心跳。
  */
 Gallery.DIR_CONCURRENCY = 3;
+
+/* 目录清单内存缓存的保鲜时间(ms)。
+ * 切走相册再切回来时,2 分钟内不重新抓目录树,直接用缓存重建视图。
+ * 超过 2 分钟自动重抓,避免照片新增后长时间看不到。
+ */
+Gallery.TREE_CACHE_TTL = 120000;
+
+/* 默认展开的"最新"目录数(其余目录收起,点目录头才加载) */
+Gallery.DEFAULT_EXPAND = 1;
 
 function Gallery(controllers) {
     this.controllers = controllers;
     this.iframe = null;
     this.rootUrl = null;     // 图库根地址,如 http://ip/DCIM
-    this.groups = [];        // 按目录分组的文件 [{name, url, files:[{url,name,type}]}]
-    this.media = [];         // 展平后的媒体列表,顺序即显示顺序
+    this.groups = [];        // 目录清单 [{name,url,loaded,loading,items:[{file,index}]}]
+    this.media = [];         // 已加载媒体的展平列表(顺序即显示顺序)
     this.rootFailed = false; // 根目录抓取是否失败
     this.lightbox = null;    // Lightbox jQuery 对象
     this.current = -1;       // Lightbox 当前索引
@@ -69,98 +69,349 @@ function Gallery(controllers) {
     this.selectMode = false; // 多选模式
     this.selection = {};     // 已选中项的索引集合
     this.downloading = false;// 批量下载进行中
-    this._renderQueue = [];  // 分批渲染队列:[{groupName, file, index}]
-    this._renderCursor = 0;  // 队列消费游标
-    this._renderDone = false;// 队列是否已全部渲染
-    this._sentinel = null;   // 滚动加载哨兵元素
     this._obs = null;        // IntersectionObserver(图片)
-    this._sentinelObs = null;// IntersectionObserver(哨兵,分批加载)
     this._loadQueue = [];    // 待发起的缩略图请求队列(限流)
     this._loading = 0;       // 已发起未完成的数量
-    this._loadDone = false;  // 目录树是否已全部抓取完毕
-    this._sentinelInView = false; // 哨兵是否处于视口(决定能否继续补渲染)
+    this._dirLoading = 0;    // 正在抓取中的目录数(限制目录请求并发)
+    this._treeCache = null;  // 目录树缓存 {rootUrl, ts, groups:[...]}
+    this._builtAt = 0;       // 上次成功构建视图的时间
     this._ioSupported = ('IntersectionObserver' in window) &&
                         ('IntersectionObserverEntry' in window);
 }
 
 /* ============ 初始化 ============ */
-Gallery.prototype.init = function (url) {
+
+/* opts.force=true 强制重新抓取(刷新按钮);否则命中 2 分钟缓存直接重建视图 */
+Gallery.prototype.init = function (url, opts) {
     var self = this;
 
     if (typeof url === 'undefined' || url === null || url === '') {
         url = 'http://' + app.hostname + '/DCIM';
     }
     self.rootUrl = url;
+    var force = !!(opts && opts.force);
+
+    // 缓存命中:直接用已抓到的目录/文件数据重建视图(免一次整树抓取)
+    if (!force && self._treeCache &&
+        self._treeCache.rootUrl === url &&
+        (Date.now() - self._treeCache.ts) < Gallery.TREE_CACHE_TTL) {
+        self.rootFailed = false;
+        self.groups = self._treeCache.groups;
+        self.media = self._treeCache.media;
+        self.resetThumbQueue();
+        self.mountFromCache();
+        return;
+    }
+
+    self._treeCache = null;
     self.groups = [];
     self.media = [];
     self.rootFailed = false;
+    self._dirLoading = 0;
     self.resetThumbQueue();
 
-    // 先搭好骨架(工具条/哨兵/观察器),再开始抓目录,
-    // 这样第一个目录读完就能立刻出图,不必等整棵树。
+    // 先搭骨架再抓根目录:一旦读到目录清单即可立即渲染目录头。
     self.startRender();
-    self.loadTree(url);
+    self.fetchRootTree(url);
 };
 
-/* ============ 递归抓取目录树 ============ */
-Gallery.prototype.loadTree = function (rootUrl) {
+/* ============ 目录树加载(只抓根清单,目录内容按需点开) ============ */
+
+/* 抓根目录页:得到子目录清单后按名倒序(最新在上)渲染目录头,
+ * 默认展开最新的 DEFAULT_EXPAND 个目录,其余收起。点开才抓该目录的文件。
+ * 不再递归全量抓取 —— 这是"目录多时相册慢"的根治点。 */
+Gallery.prototype.fetchRootTree = function (rootUrl) {
     var self = this;
-    var queue = [{url: rootUrl, name: '根目录', depth: 0}];
-    var seen = {};
-    seen[rootUrl] = true;
-    var inflight = 0;
+    self.fetchDir(rootUrl).then(function (res) {
+        var $g = $('#gallery');
+        $g.find('.gallery-loading').remove();
 
-    /* 维持 DIR_CONCURRENCY 个在途请求;全部归零即代表整棵树读完 */
-    function pump() {
-        while (inflight < Gallery.DIR_CONCURRENCY && queue.length > 0) {
-            inflight++;
-            fetchOne(queue.shift());
+        var names = [];
+        var i;
+        for (i = 0; i < res.dirs.length; i++) {
+            var d = res.dirs[i];
+            var nm = d.replace(/\/$/, '').split('/').pop();
+            if (nm && nm !== '根目录') {
+                names.push(nm);
+            }
         }
-        if (inflight === 0 && queue.length === 0) {
-            self.finishLoad();
+        // 倒序:数字目录(100PHOTO..299PHOTO)最新在上;字母目录按字典序倒排
+        names.sort().reverse();
+
+        if (names.length === 0) {
+            // 根目录无子目录:把根目录自身当做一个目录组(容错)
+            self.groups = [{
+                name: rootUrl.replace(/\/$/, '').split('/').pop() || 'DCIM',
+                url: rootUrl,
+                loaded: false, loading: false, items: []
+            }];
+            self.renderDirSections();
+            self.toggleDir(self.groups[0].name);
+            self.finishTreeLoad();
+            return;
+        }
+
+        var j;
+        for (j = 0; j < names.length; j++) {
+            self.groups.push({
+                name: names[j],
+                url: rootUrl + (rootUrl.charAt(rootUrl.length - 1) === '/' ? '' : '/') +
+                     names[j] + '/',
+                loaded: false, loading: false, items: []
+            });
+        }
+        self.renderDirSections();
+        self.finishTreeLoad();
+
+        // 默认展开最新目录(用户最想看刚拍的照片)
+        var toExpand = Math.min(Gallery.DEFAULT_EXPAND, self.groups.length);
+        for (j = 0; j < toExpand; j++) {
+            self.toggleDir(self.groups[j].name, true);
+        }
+    }, function () {
+        self.rootFailed = true;
+        var $g = $('#gallery');
+        $g.find('.gallery-loading').remove();
+        $g.find('.gallery-count').text('读取失败');
+        $g.append('<div class="gallery-error">无法读取相机相册目录(' +
+                  rootUrl + ')。<br>请确认相机 Wi-Fi 已开启、Web 服务可用。</div>');
+    });
+};
+
+/* 根清单读取完毕:缓存整棵树(供切页签回来时秒开) */
+Gallery.prototype.finishTreeLoad = function () {
+    var self = this;
+    var $g = $('#gallery');
+    var totalDirs = self.groups.length;
+    var loadedFiles = self.media.length;
+    $g.find('.gallery-count').text(totalDirs + ' 个目录 · ' +
+                                  loadedFiles + ' 张(已展开)');
+    self._treeCache = {
+        rootUrl: self.rootUrl,
+        ts: Date.now(),
+        groups: self.groups,
+        media: self.media
+    };
+    self._builtAt = Date.now();
+};
+
+/* 渲染目录头列表(全部折叠态),供点击展开 */
+Gallery.prototype.renderDirSections = function () {
+    var self = this;
+    var $g = $('#gallery');
+    var i;
+    for (i = 0; i < self.groups.length; i++) {
+        var g = self.groups[i];
+        var $sec = $('<div class="gallery-section" data-dir="' +
+                     self.escAttr(g.name) + '"></div>');
+        var $head = $('<div class="gallery-dir-head" title="点击展开/收起"></div>');
+        $head.append('<span class="gallery-dir-arrow">&#9654;</span>');
+        $head.append($('<span class="gallery-dir-name"></span>').text(g.name));
+        $head.append('<span class="gallery-dir-meta"></span>');
+        var $grid = $('<div class="gallery-grid"></div>').hide();
+        $sec.append($head).append($grid);
+        $g.append($sec);
+
+        (function (grp, sec) {
+            $head.on('click', function (ev) {
+                ev.stopPropagation();
+                if (grp.loading) {
+                    return; // 加载中不可重复点
+                }
+                self.toggleDir(grp.name);
+            });
+        })(g, $sec);
+    }
+    if (self.groups.length === 0) {
+        $g.append('<div class="gallery-empty">SD 卡上没有找到照片目录。</div>');
+    }
+};
+
+Gallery.prototype.escAttr = function (s) {
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+                    .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+};
+
+/* 找目录 */
+Gallery.prototype.findGroup = function (name) {
+    var self = this;
+    var i;
+    for (i = 0; i < self.groups.length; i++) {
+        if (self.groups[i].name === name) {
+            return self.groups[i];
         }
     }
+    return null;
+};
 
-    function fetchOne(item) {
-        self.fetchDir(item.url).then(function (res) {
-            var i;
-            // 子目录入队(限制深度,防止意外过深)
-            for (i = 0; i < res.dirs.length; i++) {
-                var d = res.dirs[i];
-                if (item.depth < 3 && !seen[d]) {
-                    seen[d] = true;
-                    var name = d.replace(/\/$/, '').split('/').pop();
-                    queue.push({url: d, name: name, depth: item.depth + 1});
-                }
-            }
-            // 过滤出媒体文件
-            var files = [];
-            for (i = 0; i < res.files.length; i++) {
-                var f = res.files[i];
-                var type = Gallery.MEDIA_EXTS[f.ext];
-                if (type) {
-                    files.push({url: f.url, name: f.name, type: type,
-                                dir: item.name});
-                }
-            }
-            // 流式:读完一个目录就渲染一个分组
-            if (files.length > 0) {
-                self.groups.push({name: item.name, url: item.url, files: files});
-                self.addGroup(item.name, files);
-            }
-            inflight--;
-            pump();
-        }, function () {
-            // 目录抓取失败:根目录失败要提示,子目录失败则跳过
-            if (item.url === rootUrl) {
-                self.rootFailed = true;
-            }
-            inflight--;
-            pump();
-        });
+/* 展开/收起目录;未加载的目录先抓文件再展开 */
+Gallery.prototype.toggleDir = function (name, forceExpand) {
+    var self = this;
+    var g = self.findGroup(name);
+    if (!g) {
+        return;
+    }
+    var $sec = $('.gallery-section[data-dir="' + self.escAttr(name) + '"]');
+    if ($sec.length === 0) {
+        return;
     }
 
-    pump();
+    if (!g.loaded && !g.loading) {
+        self.loadDir(g, $sec);
+        return;
+    }
+    if (g.loading) {
+        return;
+    }
+
+    var willExpand = forceExpand === true || !g.expanded;
+    g.expanded = willExpand;
+    var $grid = $sec.find('.gallery-grid');
+    if (willExpand) {
+        $sec.find('.gallery-dir-arrow').html('&#9660;');
+        $grid.show();
+    } else {
+        // 收起:释放网格内缩略图,节省解码内存
+        $sec.find('.gallery-dir-arrow').html('&#9654;');
+        self.releaseGridThumbs($grid);
+        $grid.hide();
+    }
+    self.refreshCounter();
+};
+
+/* 抓取目录文件列表并渲染网格 */
+Gallery.prototype.loadDir = function (g, $sec) {
+    var self = this;
+    g.loading = true;
+    $sec.find('.gallery-dir-arrow').html('&#9660;');
+    $sec.find('.gallery-dir-meta').html(
+        '<span class="gallery-dir-spinner"></span> 读取中');
+    $sec.find('.gallery-grid').show();
+
+    // 限制目录请求并发:超过 DIR_CONCURRENCY 时排队等前面的完成
+    var timer = null;
+    var poll = setInterval(function () {
+        if (self._dirLoading < Gallery.DIR_CONCURRENCY) {
+            clearInterval(poll);
+            if (timer) { clearTimeout(timer); }
+            self._dirLoading++;
+            self.fetchDir(g.url).then(function (res) {
+                g.loading = false;
+                self._dirLoading--;
+                self.buildDirGrid(g, res.files);
+            }, function () {
+                g.loading = false;
+                self._dirLoading--;
+                $sec.find('.gallery-dir-meta').text('读取失败(点击重试)');
+                $sec.find('.gallery-dir-arrow').html('&#9654;');
+            });
+        }
+    }, 80);
+};
+
+/* 把抓到的文件列表构建为网格(文件最新在前) */
+Gallery.prototype.buildDirGrid = function (g, rawFiles) {
+    var self = this;
+    var $sec = $('.gallery-section[data-dir="' + self.escAttr(g.name) + '"]');
+    var $grid = $sec.find('.gallery-grid');
+
+    // 过滤媒体,并倒序 -> 目录内最新照片在前
+    var files = [];
+    var i;
+    for (i = 0; i < rawFiles.length; i++) {
+        var f = rawFiles[i];
+        var type = Gallery.MEDIA_EXTS[f.ext];
+        if (type) {
+            files.push({url: f.url, name: f.name, type: type, dir: g.name});
+        }
+    }
+    files.reverse();
+
+    var items = [];
+    for (i = 0; i < files.length; i++) {
+        var idx = self.media.length;
+        self.media.push(files[i]);
+        items.push({file: files[i], index: idx});
+    }
+    g.items = items;
+    g.loaded = true;
+    g.expanded = true;
+
+    if (items.length === 0) {
+        $grid.empty();
+        $grid.append('<div class="gallery-dir-empty">此目录没有照片/视频</div>');
+    } else {
+        var frag = document.createDocumentFragment();
+        for (i = 0; i < items.length; i++) {
+            frag.appendChild(self.buildItem(items[i])[0]);
+        }
+        $grid.empty().append(frag);
+    }
+    $sec.find('.gallery-dir-meta').text(items.length + ' 项');
+    self.refreshCounter();
+};
+
+/* 收起目录时释放其缩略图 src(解码内存)。
+   仅在支持 IntersectionObserver 时清 src —— 不支持 IO 的降级浏览器
+   依赖 img 自带 src + loading=lazy,清掉后重展开将无法恢复。 */
+Gallery.prototype.releaseGridThumbs = function ($grid) {
+    var self = this;
+    if (!self._ioSupported) {
+        return;
+    }
+    var imgs = $grid.find('img').get();
+    var i;
+    for (i = 0; i < imgs.length; i++) {
+        var el = imgs[i];
+        self.dequeueThumb(el);
+        el._loaded = false;
+        el._queued = false;
+        if (el.getAttribute('src')) {
+            el.removeAttribute('src');
+        }
+    }
+};
+
+/* 顶部计数 */
+Gallery.prototype.refreshCounter = function () {
+    var self = this;
+    var loaded = 0;
+    var i;
+    for (i = 0; i < self.groups.length; i++) {
+        if (self.groups[i].loaded) {
+            loaded += self.groups[i].items.length;
+        }
+    }
+    $('#gallery').find('.gallery-count').text(
+        self.groups.length + ' 个目录 · ' + loaded + ' 张(已展开)');
+};
+
+/* 命中缓存:不重抓目录树,直接按已存 groups 重建视图 */
+Gallery.prototype.mountFromCache = function () {
+    var self = this;
+    self.startRender();
+    self.renderDirSections();
+    var i;
+    for (i = 0; i < self.groups.length; i++) {
+        var g = self.groups[i];
+        if (!g.loaded) {
+            continue;
+        }
+        var $sec = $('.gallery-section[data-dir="' + self.escAttr(g.name) + '"]');
+        var $grid = $sec.find('.gallery-grid');
+        g.expanded = true;
+        $sec.find('.gallery-dir-arrow').html('&#9660;');
+        $sec.find('.gallery-dir-meta').text(g.items.length + ' 项');
+        var frag = document.createDocumentFragment();
+        var j;
+        for (j = 0; j < g.items.length; j++) {
+            frag.appendChild(self.buildItem(g.items[j])[0]);
+        }
+        $grid.empty().append(frag);
+        $grid.show();
+    }
+    self.refreshCounter();
+    self._builtAt = Date.now();
 };
 
 /* 抓取单个目录页(相机端返回 Mongoose "Index of" HTML 表格) */
@@ -248,202 +499,21 @@ Gallery.resolveUrl = function (baseUrl, href) {
 
 /* ============ 渲染缩略图网格 ============ */
 
-/* 搭骨架:工具条 + 加载提示 + 哨兵 + 观察器。
-   在目录抓取之前调用,使第一个分组读完即可立即出图。 */
+/* 搭骨架:工具条 + loading 提示 + 观察器。
+   在抓根目录前调用,读到目录清单后即可立即渲染目录头。 */
 Gallery.prototype.startRender = function () {
     var self = this;
     var $g = $('#gallery').empty();
     self.selection = {};
     self.selectMode = false;
-    self._renderQueue = [];
-    self._renderCursor = 0;
-    self._renderDone = false;
-    self._loadDone = false;
 
     $g.append(self.buildToolbar());
     $g.find('.gallery-count').text('正在读取...');
-    // loading 提示放在哨兵之前(哨兵必须始终在容器末尾)
     $g.append('<div class="gallery-loading"><span class="gallery-spinner"></span>' +
               '正在读取相机相册,请稍候...</div>');
 
-    if (self._ioSupported) {
-        self._sentinel = $('<div class="gallery-sentinel"></div>').appendTo($g);
-        self.initObserver();
-    }
+    self.initObserver();
     self.initLightbox();
-};
-
-/* 流式追加一个目录分组:读完即渲染,不等整棵树 */
-Gallery.prototype.addGroup = function (name, files) {
-    var self = this;
-    var i;
-    for (i = 0; i < files.length; i++) {
-        var index = self.media.length;
-        self.media.push(files[i]);
-        self._renderQueue.push({groupName: name, file: files[i], index: index});
-    }
-
-    var $g = $('#gallery');
-    // 首个分组到达即撤掉转圈提示
-    $g.find('.gallery-loading').remove();
-    $g.find('.gallery-count').text(
-        self._loadDone ? '共 ' + self.media.length + ' 个文件'
-                       : '已读取 ' + self.media.length + ' 个文件');
-
-    if (self._ioSupported) {
-        // 首屏凑满 BATCH 前,每来一个分组就补渲染;之后交给哨兵滚动触发。
-        // 注意:若哨兵此刻仍在视口内,必须主动补一批 —— IntersectionObserver
-        // 只在"状态变化"时回调,数据后续到达不会再触发,否则会卡住不加载。
-        if (self._renderCursor < Gallery.BATCH) {
-            self.renderMore(Gallery.BATCH - self._renderCursor);
-        } else if (self._sentinelInView) {
-            self.renderMore(Gallery.BATCH);
-        } else {
-            self.updateSentinel();
-        }
-    }
-};
-
-/* 目录树全部抓取完毕:收尾(空相册提示 / 降级一次性渲染 / 结束态) */
-Gallery.prototype.finishLoad = function () {
-    var self = this;
-    self._loadDone = true;
-    var $g = $('#gallery');
-    $g.find('.gallery-loading').remove();
-
-    if (self.media.length === 0) {
-        $g.find('.gallery-count').text(self.rootFailed ? '读取失败' : '无文件');
-        if (self.rootFailed) {
-            $g.append('<div class="gallery-error">无法读取相机相册目录(' +
-                      self.rootUrl + ')。<br>请确认相机 Wi-Fi 已开启、Web 服务可用。</div>');
-        } else {
-            $g.append('<div class="gallery-empty">相册中没有找到照片或视频。</div>');
-        }
-        if (self._sentinel) {
-            self._sentinel.remove();
-            self._sentinel = null;
-        }
-        return;
-    }
-
-    $g.find('.gallery-count').text('共 ' + self.media.length + ' 个文件');
-
-    if (!self._ioSupported) {
-        // 旧浏览器降级:一次性渲染全部
-        self.renderAll();
-        return;
-    }
-    if (self._renderCursor >= self._renderQueue.length) {
-        self.finishRender();
-    } else if (self._sentinelInView) {
-        // 目录读完但队列还有余量,且哨兵可见:继续补,否则要等用户滚动才出图
-        self.renderMore(Gallery.BATCH);
-    } else {
-        self.updateSentinel();
-    }
-};
-
-/* 队列消费完毕且目录已读完 —— 真正的结束态 */
-Gallery.prototype.finishRender = function () {
-    var self = this;
-    self._renderDone = true;
-    if (self._sentinel) {
-        self._sentinel.remove();
-        self._sentinel = null;
-    }
-    $('#gallery').append($('<div class="gallery-load-all"></div>')
-        .text('已加载全部 ' + self.media.length + ' 个文件'));
-};
-
-/* 更新哨兵文案(区分"还在读目录"与"已读完只差滚动") */
-Gallery.prototype.updateSentinel = function () {
-    var self = this;
-    if (!self._sentinel) {
-        return;
-    }
-    if (self._loadDone) {
-        self._sentinel.text('已加载 ' + self._renderCursor + ' / ' +
-                            self._renderQueue.length + ' ...');
-    } else {
-        self._sentinel.text('读取中 ' + self._renderCursor + ' / 已发现 ' +
-                            self._renderQueue.length + ' ...');
-    }
-};
-
-/* 一次性渲染全部(不支持 IntersectionObserver 时的降级路径) */
-Gallery.prototype.renderAll = function () {
-    var self = this;
-    var $g = $('#gallery');
-    var currentGroup = null;
-    var $grid = null;
-    var i;
-    for (i = 0; i < self._renderQueue.length; i++) {
-        var item = self._renderQueue[i];
-        if (item.groupName !== currentGroup) {
-            currentGroup = item.groupName;
-            var $sec = $('<div class="gallery-section"></div>');
-            $sec.append($('<div class="gallery-dir-name"></div>').text(item.groupName));
-            $grid = $('<div class="gallery-grid"></div>');
-            $sec.append($grid);
-            $g.append($sec);
-        }
-        $grid.append(self.buildItem(item));
-    }
-    self._renderDone = true;
-    self._renderQueue = [];
-};
-
-/* 从队列渲染下一批(每批 BATCH 张,跨目录时自动插入分组头) */
-Gallery.prototype.renderMore = function (count) {
-    var self = this;
-    if (self._renderDone) {
-        return;
-    }
-    var $g = $('#gallery');
-    var currentGroup = null;
-    var $grid = null;
-
-    // 定位当前已渲染到的分组,以便跨批续接
-    var lastSec = $g.children('.gallery-section').last();
-    if (lastSec.length > 0) {
-        currentGroup = lastSec.find('.gallery-dir-name').text();
-        $grid = lastSec.find('.gallery-grid');
-    }
-
-    var rendered = 0;
-    while (self._renderCursor < self._renderQueue.length && rendered < count) {
-        var item = self._renderQueue[self._renderCursor];
-        if (item.groupName !== currentGroup) {
-            currentGroup = item.groupName;
-            var $sec = $('<div class="gallery-section"></div>');
-            $sec.append($('<div class="gallery-dir-name"></div>').text(item.groupName));
-            $grid = $('<div class="gallery-grid"></div>');
-            $sec.append($grid);
-            // 插到哨兵之前(哨兵必须始终在网格末尾)
-            if (self._sentinel) {
-                self._sentinel.before($sec);
-            } else {
-                $g.append($sec);
-            }
-        }
-        $grid.append(self.buildItem(item));
-        self._renderCursor++;
-        rendered++;
-    }
-
-    // 队列消费完:目录也已读完才是真结束,否则保留哨兵等后续分组到达
-    if (self._renderCursor >= self._renderQueue.length) {
-        if (self._loadDone) {
-            self.finishRender();
-        } else {
-            self.updateSentinel();
-        }
-    } else if (self._sentinelInView) {
-        // 哨兵仍在视口内:继续补一批,避免"新数据到达却无人触发渲染"
-        self.renderMore(Gallery.BATCH);
-    } else {
-        self.updateSentinel();
-    }
 };
 
 /* 构建单个网格项(图片不设 src,由 IO 按视口加载/释放) */
@@ -559,22 +629,6 @@ Gallery.prototype.initObserver = function () {
         rootMargin: '150% 0px',
         threshold: 0.01
     });
-
-    // 哨兵观察器:rootMargin 小,保证"进入/离开"状态切换以持续触发分批加载
-    // (若与图片同用大 rootMargin,哨兵会一直处于 intersecting,批次只触发一次)
-    if (self._sentinel) {
-        self._sentinelObs = new IntersectionObserver(function (entries) {
-            // 记录可见状态:流式追加分组时据此判断能否继续补渲染
-            self._sentinelInView = entries[0].isIntersecting;
-            if (self._sentinelInView) {
-                self.renderMore(Gallery.BATCH);
-            }
-        }, {
-            rootMargin: '300px 0px',
-            threshold: 0
-        });
-        self._sentinelObs.observe(self._sentinel[0]);
-    }
 };
 
 /* ============ 缩略图请求限流队列 ============ */
@@ -646,10 +700,6 @@ Gallery.prototype.removeObserver = function () {
     if (self._obs) {
         self._obs.disconnect();
         self._obs = null;
-    }
-    if (self._sentinelObs) {
-        self._sentinelObs.disconnect();
-        self._sentinelObs = null;
     }
 };
 
