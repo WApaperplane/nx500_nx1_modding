@@ -1,0 +1,95 @@
+#!/bin/sh
+# ============================================================
+# push-cgi - NX-KS2 WiFi 在线同步接收端 (busybox httpd CGI, 8080)
+#
+# 作用: 由 PC 端 push.sh 调用, 把电脑上最新 web 前端文件直接写入
+#       相机内部 /opt/usr/nx-ks/nx-rc/web_root/, 免拔 SD 卡。
+#
+# 部署(相机端, 已由 push-install.sh 完成):
+#   push-cgi -> /opt/usr/nx-ks/capdtm/www/cgi-bin/push
+#   8080 httpd 由 capdtm-httpd.sh 提供(cgi-bin 目录下的可执行文件即 CGI)
+#
+# 协议:
+#   POST /cgi-bin/push?path=nx-rc/web_root/js/gallery.js
+#         body = 文件原始内容(Content-Type: application/octet-stream)
+#   GET  /cgi-bin/push?action=apply
+#         全部文件推送完后调用: 重启 web daemon 让新文件干净生效
+#
+# 安全: 目标路径强制限定 nx-rc/web_root/ 前缀 + 禁 ".." 穿越。
+#       只能覆盖静态页面文件(html/css/js/字体), 无法触碰
+#       cgi-bin / 可执行二进制 / 系统路径 / SD 卡文件。
+# ============================================================
+
+ROOT=/opt/usr/nx-ks
+PREFIX=nx-rc/web_root/
+
+resp() {
+    echo "Content-Type: application/json; charset=utf-8"
+    echo "Cache-Control: no-store"
+    echo "Access-Control-Allow-Origin: *"
+    echo ""
+    echo "$1"
+    exit 0
+}
+
+# ---- 解析 QUERY_STRING: path=...&action=... ----
+ARG_PATH=""
+ACTION=""
+QS=$QUERY_STRING
+[ -z "$QS" ] && QS=""
+IFS='&'
+for pair in $QS; do
+    [ -z "$pair" ] && continue
+    key=${pair%%=*}
+    val=${pair#*=}
+    case "$key" in
+        path)   ARG_PATH=$val ;;
+        action) ACTION=$val ;;
+    esac
+done
+unset IFS
+
+# ---- action=ping: 在线探测(不产生副作用) ----
+if [ "$ACTION" = "ping" ]; then
+    resp '{"ok":true,"action":"ping"}'
+fi
+
+# ---- action=apply: 重启 web daemon ----
+if [ "$ACTION" = "apply" ]; then
+    killall -q nx-remote-controller-daemon 2>/dev/null
+    sleep 1
+    [ -x "$ROOT/nx-rc/nx-remote-controller-daemon" ] && \
+        nice -n 19 "$ROOT/nx-rc/nx-remote-controller-daemon" >/dev/null 2>&1 &
+    resp '{"ok":true,"action":"apply"}'
+fi
+
+# ---- path 白名单校验 ----
+case "$ARG_PATH" in
+    "$PREFIX"*) ;;
+    *) resp "{\"ok\":false,\"error\":\"forbidden path: $ARG_PATH\"}" ;;
+esac
+case "$ARG_PATH" in
+    *".."*|*"//"*) resp '{"ok":false,"error":"forbidden path"}' ;;
+esac
+
+TARGET="$ROOT/$ARG_PATH"
+TDIR=$(dirname "$TARGET")
+mkdir -p "$TDIR" 2>/dev/null || resp '{"ok":false,"error":"mkdir failed"}'
+
+# ---- 接收 body(原样写盘, 原子替换) ----
+TMP="$TARGET.part.$$"
+if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
+    head -c "$CONTENT_LENGTH" > "$TMP" 2>/dev/null
+else
+    cat > "$TMP" 2>/dev/null
+fi
+
+if [ -s "$TMP" ]; then
+    chmod 644 "$TMP"
+    mv -f "$TMP" "$TARGET"
+    sync
+    resp "{\"ok\":true,\"path\":\"$ARG_PATH\",\"bytes\":$(wc -c < "$TARGET")}"
+else
+    rm -f "$TMP"
+    resp '{"ok":false,"error":"empty body"}'
+fi

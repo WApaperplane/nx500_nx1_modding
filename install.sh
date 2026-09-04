@@ -1,58 +1,98 @@
 #!/bin/bash
+# ============================================================
+# NX-KS2 智能引导器 (本文件放 SD 卡根目录, 被相机自动执行)
 #
+# 触发链(不可改, 相机固件行为):
+#   SD 根 info.tg -> nx_cs.adj(内容固定为 "shell script /mnt/mmc/install.sh")
+#   -> 相机 dfmsd 检测到后自动执行 /mnt/mmc/install.sh(即本文件), 无需任何按键
+#
+# 自动分派(按是否已安装):
+#   [ 未安装 ] bluetoothd.orig 不存在 -> 全量安装(仅首次装机)
+#       与经典 NX-KS 相同: 挂载蓝牙开机钩子 + cp -ar scripts -> /opt/usr/nx-ks
+#   [ 已安装 ] bluetoothd.orig 存在   -> 增量同步(日常更新走这里, 安全)
+#       只做 cp -ar /mnt/mmc/scripts/* 覆盖 /opt/usr/nx-ks/ (只覆盖不删除)
+#       绝不触碰 bluetoothd 钩子, 绝不删除相机上已装文件, 永不"卸载"
+#       需要卸载请用相机菜单里的 uninstall.sh(手动确认, 不会误触)
+#
+# 每次执行后只清理 SD 卡根的 3 个触发文件(info.tg / nx_cs.adj / 本脚本),
+# SD 卡上的 scripts/ 母本【保留】, 你随时能在电脑上查看/编辑。
+#
+# 日常更新三步走(已装机器):
+#   1. 电脑上把最新 scripts/ 拷进 SD 卡
+#   2. 把 info.tg + nx_cs.adj + 本文件(仓库根的最新版)也拷进 SD 卡根
+#   3. 插卡 -> 相机自动增量同步 -> 弹窗提示 -> 自动重启, 拔卡即可
+# 全程不需要重刷固件, 也不会误触发卸载。
+#
+# 注意: 本文件为仓库根 install.sh 的新版。旧版"二象性"install.sh
+#       (装过再跑=卸载) 已废弃, 请勿再使用。
+# ============================================================
+
+# ---- 确保在拍照界面(LCD 输出), 否则尝试切换 ----
 [[ $(echo $(st cap capdtm getusr MONITOROUT) | grep LCD) > ""  ]] || { $( st app disp lcd ) &&  sleep 1 ; }
-[[ $(echo $(st cap capdtm getusr MONITOROUT) | grep LCD) > ""  ]] || exit   
-#
-if [ $(/bin/grep ^NX500$ /etc/version.info) = "NX500" -a $(/bin/grep ^1.12$ /etc/version.info) = "1.12" ] ||
- [ $(/bin/grep   ^NX1$   /etc/version.info) = "NX1" -a $(/bin/grep ^1.41$ /etc/version.info) = "1.41"  ]; then
-    if [ ! -x /usr/sbin/bluetoothd.orig ]; then
-        /mnt/mmc/scripts/popup_timeout  " [  正在安装...  ] " 4 &
-        mount -o remount,rw /
-        mv /usr/sbin/bluetoothd /usr/sbin/bluetoothd.orig
-        cat >/usr/sbin/bluetoothd << EOF
+[[ $(echo $(st cap capdtm getusr MONITOROUT) | grep LCD) > ""  ]] || exit
+
+# ---- 固件版本校验: NX500 1.12 / NX1 1.41 ----
+VEROK=0
+IS_NX1=0
+{ /bin/grep -q '^NX500$' /etc/version.info && /bin/grep -q '^1.12$' /etc/version.info; } && VEROK=1
+if { /bin/grep -q '^NX1$' /etc/version.info && /bin/grep -q '^1.41$' /etc/version.info; }; then
+    VEROK=1; IS_NX1=1
+fi
+if [ "$VEROK" != "1" ]; then
+    [ -x /mnt/mmc/scripts/popup_timeout ] && /mnt/mmc/scripts/popup_timeout " [  固件版本不支持  ] " 2 &
+    exit 1
+fi
+
+POPUP=/mnt/mmc/scripts/popup_timeout
+[ -x "$POPUP" ] || POPUP=/opt/usr/nx-ks/popup_timeout
+
+if [ ! -x /usr/sbin/bluetoothd.orig ]; then
+    # ================= 全量安装(仅首次装机) =================
+    "$POPUP" " [  正在安装...  ] " 4 &
+    mount -o remount,rw /
+    mv /usr/sbin/bluetoothd /usr/sbin/bluetoothd.orig
+    cat >/usr/sbin/bluetoothd << EOF
 #!/bin/bash
 if [ -x /opt/usr/nx-ks/init.sh ]; then
   /opt/usr/nx-ks/init.sh
 fi
 EOF
-          chmod +x /usr/sbin/bluetoothd
-          mount -o remount,ro /
-          sleep 5
-          mkdir -p /opt/usr/nx-ks
-          cp -ar /mnt/mmc/scripts/* /opt/usr/nx-ks/
-          sync;sync;sync
-          /mnt/mmc/scripts/popup_timeout  " [ 安装完成 ] " 3
-    else
-          /mnt/mmc/scripts/popup_timeout  " [  检测到BT模块  ] " 2
-          /mnt/mmc/scripts/popup_timeout  " [  正在清理...  ] " 4 &
-          killall -q keyscan
-          killall -q mod_gui
-          rm /tmp/keyscan.pid
-          rm -r /opt/usr/nx-ks/
-          rm -r /opt/home/scripts
-          rm /root/mod_lapse.cfg
-          swapoff /opt/usr/home/swapmod
-          rm /opt/usr/home/swapmod
-          mount -o remount,rw /
-          rm /usr/sbin/bluetoothd
-          mv /usr/sbin/bluetoothd.orig /usr/sbin/bluetoothd
-          chmod +x /usr/sbin/bluetoothd
-          mount -o remount,ro /
-          sleep 5  
-          /mnt/mmc/scripts/popup_timeout  " [  系统已清理干净  ] " 3 
-          sync;sync;sync
-          reboot
-    fi
-      [ $(/bin/grep   ^NX1$   /etc/version.info) = "NX1" -a $(/bin/grep ^1.41$ /etc/version.info) = "1.41"  ] && mv /opt/usr/nx-ks/EV_EV.sh /opt/usr/nx-ks/EV_OK.sh
-      [ $(/bin/grep   ^NX1$   /etc/version.info) = "NX1" -a $(/bin/grep ^1.41$ /etc/version.info) = "1.41"  ] && cp /opt/usr/nx-ks/keyscan1 /opt/usr/nx-ks/keyscan
-      killall dfmsd
-      rm /mnt/mmc/info.tg
-      rm /mnt/mmc/nx_cs.adj
-      rm /mnt/mmc/install.sh
-      rm /mnt/mmc/NX-KS2_readme.odt
-      rm -r /mnt/mmc/scripts/
+    chmod +x /usr/sbin/bluetoothd
+    mount -o remount,ro /
+    sleep 5
+    mkdir -p /opt/usr/nx-ks
+    cp -ar /mnt/mmc/scripts/* /opt/usr/nx-ks/
     sync;sync;sync
-    reboot
-else 
-    /mnt/mmc/scripts/popup_timeout  " [  固件版本不支持  ] " 2 &
+    "$POPUP" " [ 安装完成 ] " 3
+else
+    # ================= 增量同步(日常更新, 安全) =================
+    if [ ! -d /mnt/mmc/scripts ]; then
+        "$POPUP" " [ 错误: SD 卡无 scripts/ ] " 3
+        exit 1
+    fi
+    "$POPUP" " [  正在同步...  ] " 4 &
+    # 停掉运行中的 web 遥控/键控进程, 保证覆盖后干净重启
+    killall -q nx-remote-controller-daemon 2>/dev/null
+    killall -q onscreen_rc 2>/dev/null
+    killall -q nx-input-injector 2>/dev/null
+    killall -q xev-nx 2>/dev/null
+    # SD 母本全量覆盖相机内部运行副本(只覆盖不删除, 幂等可重复执行)
+    cp -ar /mnt/mmc/scripts/* /opt/usr/nx-ks/
+    sync;sync;sync
+    "$POPUP" " [  同步完成  ] " 3
+    sleep 1
 fi
+
+# ---- NX1 特判(两分支共用; 幂等) ----
+if [ "$IS_NX1" = "1" ]; then
+    [ -f /opt/usr/nx-ks/EV_EV.sh ] && mv -f /opt/usr/nx-ks/EV_EV.sh /opt/usr/nx-ks/EV_OK.sh
+    [ -f /opt/usr/nx-ks/keyscan1 ]  && cp -f /opt/usr/nx-ks/keyscan1 /opt/usr/nx-ks/keyscan
+fi
+
+# ---- 清理 SD 卡根触发文件(防止忘拔卡导致下次开机重复执行); scripts/ 与 odt 文档保留 ----
+killall dfmsd 2>/dev/null
+rm -f /mnt/mmc/info.tg
+rm -f /mnt/mmc/nx_cs.adj
+rm -f /mnt/mmc/install.sh
+sync;sync;sync
+reboot
