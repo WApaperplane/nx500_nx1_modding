@@ -10,12 +10,14 @@
 
 SELF=$(cd "$(dirname "$0")" && pwd)
 NX_KS=/opt/usr/nx-ks
-CGI_TARGET=$NX_KS/capdtm/www/cgi-bin/push
+# 相机端实际布局:capdtm 在 nx-rc 之下(2026-09-04 修正)
+CGI_DIR=$NX_KS/nx-rc/capdtm/www/cgi-bin
+CGI_TARGET=$CGI_DIR/push
 
-# 目标 httpd 目录不存在(capdtm 模块缺失)时给出提示但不中断
-if [ ! -d "$NX_KS/capdtm/www/cgi-bin" ]; then
-    echo "错误: 未找到 $NX_KS/capdtm/www/cgi-bin(先安装/同步 nx-rc 模块)" >&2
-    exit 1
+# 目标 httpd 目录不存在(capdtm 模块缺失)时主动创建,不中断
+if [ ! -d "$CGI_DIR" ]; then
+    echo "提示: $CGI_DIR 不存在,自动创建" >&2
+    mkdir -p "$CGI_DIR" 2>/dev/null || { echo "错误: 目录创建失败" >&2; exit 1; }
 fi
 
 cp -f "$SELF/push-cgi" "$CGI_TARGET"
@@ -23,8 +25,8 @@ chmod +x "$CGI_TARGET"
 echo "push-cgi 已安装 -> $CGI_TARGET"
 
 # 确保 8080 httpd 在跑(thumb-install.sh start 也会做同样的事)
-if [ -x "$NX_KS/capdtm/capdtm-httpd.sh" ]; then
-    "$NX_KS/capdtm/capdtm-httpd.sh" start
+if [ -x "$NX_KS/nx-rc/capdtm/capdtm-httpd.sh" ]; then
+    "$NX_KS/nx-rc/capdtm/capdtm-httpd.sh" start
 fi
 
 exit 0

@@ -22,8 +22,9 @@
 #   确保 capdtm-httpd.sh 已启动(8080 端口 busybox httpd)。
 # ============================================================
 
-# ---- 工具路径(NX-KS 固定布局) ----
-TOOLS=/opt/usr/nx-ks/tools
+# ---- 工具路径(NX-KS 实际布局:install.sh 把 scripts/* 拷到 /opt/usr/nx-ks/,
+#      本模块位于 nx-rc 之下;旧路径 /opt/usr/nx-ks/tools 从未存在 2026-09-04) ----
+TOOLS=/opt/usr/nx-ks/nx-rc/tools
 CONVERT=$TOOLS/usr/bin/convert
 LD_LIBRARY_PATH=$TOOLS/usr/lib
 export LD_LIBRARY_PATH
@@ -173,7 +174,10 @@ fi
 
 # ---- 输出 ----
 echo "Content-Type: image/jpeg"
-echo "Cache-Control: public, max-age=86400"
+# 浏览器缓存 1 小时:足够挡住同一会话内的重复请求,
+# 又不会在照片被删后重传同名文件时长期显示旧缩略图。
+# 重新请求的代价很低 —— SD 卡 .thumbcache 命中时只是 cat 一个小文件。
+echo "Cache-Control: public, max-age=3600"
 echo ""
 cat "$CACHE"
 

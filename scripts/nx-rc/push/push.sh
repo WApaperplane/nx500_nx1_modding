@@ -46,7 +46,9 @@ fi
 BASE="http://$HOST:$PORT/cgi-bin/push"
 
 # ---- 探测 push 接收端在线(ping 无副作用) ----
-probe=$(curl -s --max-time 5 "$BASE?action=ping" 2>/dev/null)
+# --noproxy: 本机系统代理会把对相机内网地址的请求转发出去,
+# 返回 502 假象, 导致"明明 httpd 活着却探测失败"(2026-09-04)
+probe=$(curl -s --noproxy '*' --max-time 5 "$BASE?action=ping" 2>/dev/null)
 case "$probe" in
     *'"ok":true'*) ;;
     *) echo "错误: $HOST:$PORT 无响应或未安装 push 接收端。"
@@ -69,7 +71,7 @@ for rel in "${RELS[@]}"; do
         echo "跳过(本地不存在): $rel"
         continue
     fi
-    out=$(cd "$WEB_ROOT" && curl -s --max-time 30 --data-binary "@$rel" \
+    out=$(cd "$WEB_ROOT" && curl -s --noproxy '*' --max-time 30 --data-binary "@$rel" \
           -H "Content-Type: application/octet-stream" \
           "$BASE?path=nx-rc/web_root/$rel" 2>/dev/null)
     case "$out" in
@@ -79,7 +81,7 @@ for rel in "${RELS[@]}"; do
 done
 
 echo "==> 重启相机 web daemon..."
-out=$(curl -s --max-time 15 "$BASE?action=apply" 2>/dev/null)
+out=$(curl -s --noproxy '*' --max-time 15 "$BASE?action=apply" 2>/dev/null)
 case "$out" in
     *'"ok":true'*) echo "==> 完成。浏览器请硬刷新一次(Ctrl+F5)。" ;;
     *) echo "!!  apply 未确认: $out (可稍后手动刷新页面观察)"; FAIL=1 ;;

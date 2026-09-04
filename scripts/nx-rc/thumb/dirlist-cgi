@@ -1,0 +1,108 @@
+#!/bin/sh
+# ============================================================
+# dirlist - DCIM 实时目录列表 CGI (8080 busybox httpd)
+#
+# 为什么存在(2026-09-05):
+#   前端相册原本抓 80 端口 daemon 的 /DCIM 目录页,但那是
+#   daemon 启动时的快照,新拍照片不会出现在列表里,导致
+#   "相册看不到最新照片"。本 CGI 每次请求都实时 readdir SD 卡。
+#
+# 访问:
+#   GET /cgi-bin/dirlist?p=<DCIM相对路径>
+#   例: /cgi-bin/dirlist?p=          -> 根(子目录清单)
+#       /cgi-bin/dirlist?p=575PHOTO  -> 该目录文件清单
+# 返回 JSON:
+#   {"ok":true,"dirs":["575PHOTO"],"files":["SAM_3032.JPG"]}
+#   dirs 为空数组时表示该层没有子目录。
+#
+# 部署: thumb-install.sh 会把本文件复制到 capdtm/www/cgi-bin/dirlist
+# ============================================================
+
+SD=""
+for cand in /mnt/mmc /tmp/mmc /mnt/sd /tmp/sd; do
+    if [ -d "$cand/DCIM" ]; then
+        SD=$cand
+        break
+    fi
+done
+
+json_fail() {
+    echo "Content-Type: application/json"
+    echo "Access-Control-Allow-Origin: *"
+    echo "Cache-Control: no-store"
+    echo ""
+    printf '{"ok":false,"err":"%s"}' "$1"
+    exit 0
+}
+
+urldecode() {
+    case "$1" in
+        *%*) printf '%b' "$(printf '%s' "$1" | sed 's/%/\\x/g')" ;;
+        *)   printf '%s' "$1" ;;
+    esac
+}
+
+[ -z "$SD" ] && json_fail "SD card not found"
+
+P=""
+QS=${QUERY_STRING:-}
+IFS='&'
+for pair in $QS; do
+    [ -z "$pair" ] && continue
+    key=${pair%%=*}
+    val=${pair#*=}
+    case "$key" in
+        p) P=$(urldecode "$val") ;;
+    esac
+done
+unset IFS
+
+# ---- 路径安全:仅允许 DCIM 下相对路径,禁止 .. 与绝对路径 ----
+P=$(printf '%s' "$P" | sed 's#^/*##; s#/*$##')
+case "$P" in
+    *".."*|*";"*|*"|"*|*"&"*|*"\\"*) json_fail "invalid path" ;;
+esac
+
+TARGET="$SD/DCIM/$P"
+[ -d "$TARGET" ] || json_fail "not found"
+
+# ---- 列目录:目录与文件分开(busybox ls -F 用尾缀 / 标记目录) ----
+DIRS=""
+FILES=""
+TMP=$(mktemp 2>/dev/null || echo "/tmp/dirlist.$$")
+ls -F "$TARGET" > "$TMP" 2>/dev/null || { rm -f "$TMP"; json_fail "readdir failed"; }
+
+while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    base=${name%/}          # 去掉 -F 加的目录尾缀 /
+    base=${base%\*}         # 去掉 -F 加的可执行标记 *(FAT 挂载全部带 x)
+    # JSON 字符串安全(文件名来自相机,基本 ASCII,这里兜底转义)
+    esc=$(printf '%s' "$base" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    case "$name" in
+        */)
+            case "$base" in
+                .*) continue ;;   # 跳过隐藏目录(.thumbcache 不在 DCIM 内,保险)
+            esac
+            DIRS="$DIRS\"$esc\","
+            ;;
+        *)
+            # 只要有扩展名的都报给前端,媒体过滤交给前端(与旧 HTML 列表行为一致)
+            case "$base" in
+                .*) continue ;;
+            esac
+            FILES="$FILES\"$esc\","
+            ;;
+    esac
+done < "$TMP"
+rm -f "$TMP"
+
+# 去掉末尾逗号
+DIRS=${DIRS%,}
+FILES=${FILES%,}
+
+echo "Content-Type: application/json"
+echo "Access-Control-Allow-Origin: *"
+echo "Cache-Control: no-store"
+echo ""
+printf '{"ok":true,"path":"%s","dirs":[%s],"files":[%s]}' "$P" "$DIRS" "$FILES"
+exit 0

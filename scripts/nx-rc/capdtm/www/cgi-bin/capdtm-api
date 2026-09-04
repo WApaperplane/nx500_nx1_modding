@@ -4,7 +4,7 @@
 # 通过 st cap capdtm getusr/setusr 读取/写入拍摄参数。
 #
 # 部署(相机端,需 NX-KS root):
-#   1. 拷贝本目录到  /opt/usr/nx-ks/capdtm/
+#   1. 拷贝本目录到  /opt/usr/nx-ks/nx-rc/capdtm/
 #   2. 运行  capdtm-httpd.sh 启动 8080 端口 httpd(CGI 指向本脚本)
 #   3. 校准参数:编辑 capdtm.conf,按实际固件版本核对取值
 #
@@ -14,7 +14,7 @@
 # ============================================================
 
 ST=/usr/bin/st
-BASE=/opt/usr/nx-ks/capdtm
+BASE=/opt/usr/nx-ks/nx-rc/capdtm
 CONF=$BASE/capdtm.conf
 
 echo "Content-Type: application/json; charset=utf-8"

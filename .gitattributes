@@ -1,0 +1,7 @@
+# 相机端脚本与前端资源必须 LF（Tizen/DRIMe5 的 sh 不兼容 CRLF）
+* text=auto eol=lf
+*.docx binary
+*.zip binary
+*.JPG binary
+*.jpg binary
+*.png binary

@@ -48,10 +48,12 @@ Gallery.MAX_CONCURRENT = 2;
 Gallery.DIR_CONCURRENCY = 3;
 
 /* 目录清单内存缓存的保鲜时间(ms)。
- * 切走相册再切回来时,2 分钟内不重新抓目录树,直接用缓存重建视图。
- * 超过 2 分钟自动重抓,避免照片新增后长时间看不到。
+ * 切走相册再切回来时,30 秒内不重新抓目录树,直接用缓存重建视图(秒开)。
+ * 之前是 2 分钟,导致"遥控页拍完照切回相册看不到新照片"——
+ * 拍照到回看的间隔通常落在 2 分钟内,全部被缓存吞掉;收紧到 30 秒
+ * 既能挡住快速来回切页签的重复抓取,又不影响新照片回看(2026-09-04)。
  */
-Gallery.TREE_CACHE_TTL = 120000;
+Gallery.TREE_CACHE_TTL = 30000;
 
 /* 默认展开的"最新"目录数(其余目录收起,点目录头才加载) */
 Gallery.DEFAULT_EXPAND = 1;
@@ -414,8 +416,81 @@ Gallery.prototype.mountFromCache = function () {
     self._builtAt = Date.now();
 };
 
-/* 抓取单个目录页(相机端返回 Mongoose "Index of" HTML 表格) */
+/* 目录列表服务:8080 实时 dirlist CGI 优先(2026-09-05)。
+ * 80 端口 daemon 的 /DCIM 目录页是启动快照,新拍照片不出现,
+ * 导致相册看不到最新照片;8080 CGI 每次请求都实时 readdir SD 卡。
+ * dirlist 不可用时回退 80 端口 HTML 解析(旧行为)。 */
+Gallery.DIRLIST = {
+    enabled: true,
+    port: 8080
+};
+
+/* 抓取单个目录:优先 JSON 实时列表,失败回退 HTML 解析 */
 Gallery.prototype.fetchDir = function (url) {
+    var self = this;
+    return self.fetchDirJson(url).then(null, function () {
+        return self.fetchDirHtml(url);
+    });
+};
+
+/* 从 80 端口目录 URL 提取 DCIM 相对路径('' = 根) */
+Gallery.dirRelPath = function (url) {
+    var m = String(url).match(/\/DCIM\/?(.*)$/);
+    if (!m) {
+        return null;
+    }
+    return decodeURIComponent(m[1]).replace(/\/+$/, '');
+};
+
+/* 8080 dirlist:实时 JSON 目录列表 */
+Gallery.prototype.fetchDirJson = function (url) {
+    var self = this;
+    return new Promise(function (resolve, reject) {
+        if (!Gallery.DIRLIST.enabled) {
+            reject(new Error('dirlist disabled'));
+            return;
+        }
+        var rel = Gallery.dirRelPath(url);
+        if (rel === null) {
+            reject(new Error('not a DCIM url: ' + url));
+            return;
+        }
+        var host = app.hostname || self.rootUrl &&
+                   self.rootUrl.replace(/^https?:\/\//, '').split(':')[0].split('/')[0];
+        $.ajax({
+            url: 'http://' + host + ':' + Gallery.DIRLIST.port +
+                 '/cgi-bin/dirlist?p=' + encodeURIComponent(rel),
+            dataType: 'json',
+            cache: false,
+            timeout: 15000
+        }).done(function (res) {
+            if (!res || res.ok !== true) {
+                reject(new Error('dirlist bad response'));
+                return;
+            }
+            var baseUrl = 'http://' + host + '/DCIM/' + (rel ? rel + '/' : '');
+            var out = {dirs: [], files: []};
+            var i;
+            for (i = 0; i < (res.dirs || []).length; i++) {
+                out.dirs.push(baseUrl + res.dirs[i] + '/');
+            }
+            for (i = 0; i < (res.files || []).length; i++) {
+                var name = res.files[i];
+                var m = name.match(/\.([a-zA-Z0-9]+)$/);
+                var ext = m ? '.' + m[1].toLowerCase() : '';
+                if (ext && Gallery.MEDIA_EXTS[ext]) {
+                    out.files.push({url: baseUrl + name, name: name, ext: ext});
+                }
+            }
+            resolve(out);
+        }).fail(function () {
+            reject(new Error('dirlist fetch failed'));
+        });
+    });
+};
+
+/* 80 端口回退:抓取目录页 HTML(Mongoose "Index of" 表格) */
+Gallery.prototype.fetchDirHtml = function (url) {
     return new Promise(function (resolve, reject) {
         $.ajax({
             url: url,
@@ -710,7 +785,9 @@ Gallery.prototype.buildToolbar = function () {
     $bar.append($('<span class="gallery-count"></span>').text('共 ' + self.media.length + ' 个文件'));
     var $refresh = $('<button type="button" class="btn btn-xs btn-default">刷新</button>')
         .on('click', function () {
-            self.init(self.rootUrl);
+            // 必须带 force:否则 2 分钟 TTL 内命中目录树缓存,
+            // 点了刷新却什么都不重抓,拍完新照片看不到(2026-09-04 修复)
+            self.init(self.rootUrl, {force: true});
         });
     var $orig = $('<button type="button" class="btn btn-xs btn-default">原始目录视图</button>')
         .on('click', function () {
@@ -883,7 +960,9 @@ Gallery.prototype.showIframeView = function () {
     var $bar = $('<div class="gallery-toolbar"></div>');
     $bar.append($('<button type="button" class="btn btn-xs btn-default">返回缩略图视图</button>')
         .on('click', function () {
-            self.init(self.rootUrl);
+            // force:原始目录视图期间可能拍了对新照片,
+            // 返回时不能沿用旧目录树缓存
+            self.init(self.rootUrl, {force: true});
         }));
     $g.append($bar);
 
