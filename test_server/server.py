@@ -6,9 +6,16 @@
 """
 import os
 import sys
+import io
 import datetime
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    from PIL import Image, ImageOps
+    HAVE_PIL = True
+except ImportError:
+    HAVE_PIL = False
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 # 直接引用真实的前端文件,改动即时生效(测试对象即交付物)
@@ -141,6 +148,55 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps({'ok': False, 'error': 'unknown action'})
         self._send(200, 'application/json; charset=utf-8', body, cors)
 
+    def handle_thumb(self, parsed):
+        """模拟相机端 /cgi-bin/thumb 缩略图端点(Pillow 生成,行为与 thumb-cgi 一致)。
+        参数: f=<DCIM相对路径> w=<宽> q=<质量>"""
+        qs = urllib.parse.parse_qs(parsed.query)
+        f = (qs.get('f') or [''])[0].strip('/')
+        w = (qs.get('w') or ['400'])[0]
+        q = (qs.get('q') or ['82'])[0]
+        if not w.isdigit() or not q.isdigit():
+            self._send(200, 'text/plain; charset=utf-8', 'thumb error: bad w/q')
+            return
+        w = max(64, min(1024, int(w)))
+        q = max(50, min(95, int(q)))
+        # 路径安全:只允许 DCIM 下相对路径
+        if not f or '..' in f or '//' in f or '\\' in f:
+            self._send(200, 'text/plain; charset=utf-8', 'thumb error: invalid path')
+            return
+        if f.startswith('DCIM/'):
+            f = f[len('DCIM/'):]
+        ext = f.rsplit('.', 1)[-1].lower() if '.' in f else ''
+        if ext not in ('jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff'):
+            self._send(200, 'text/plain; charset=utf-8', 'thumb error: unsupported type')
+            return
+        src = os.path.join(SDCARD, 'DCIM', f)
+        if not os.path.isfile(src):
+            self._send(200, 'text/plain; charset=utf-8', 'thumb error: source not found')
+            return
+        if not HAVE_PIL:
+            self._send(200, 'text/plain; charset=utf-8',
+                       'thumb error: Pillow not installed (pip install Pillow)')
+            return
+        try:
+            img = Image.open(src)
+            img = ImageOps.exif_transpose(img)   # 与 convert -auto-orient 对应
+            img.thumbnail((w, w), Image.LANCZOS)
+            if img.mode not in ('RGB', 'L'):
+                img = img.convert('RGB')
+            buf = io.BytesIO()
+            img.save(buf, 'JPEG', quality=q)
+            data = buf.getvalue()
+        except Exception as e:
+            self._send(200, 'text/plain; charset=utf-8', 'thumb error: %s' % e)
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'public, max-age=86400')
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self, head_only=False):
         parsed = urllib.parse.urlparse(self.path)
         path = urllib.parse.unquote(parsed.path)
@@ -148,6 +204,11 @@ class Handler(BaseHTTPRequestHandler):
         # ---- capdtm 参数 API(真实相机由 busybox httpd + CGI 提供,CORS 头) ----
         if path.startswith('/capdtm/api') or path.startswith('/cgi-bin/capdtm-api'):
             self.handle_capdtm(parsed)
+            return
+
+        # ---- 缩略图端点(与相机端 thumb-cgi 行为一致) ----
+        if path == '/cgi-bin/thumb':
+            self.handle_thumb(parsed)
             return
 
         # ---- 相机控制 API 占位(真实相机由 daemon 提供,此处仅消除 404 噪音) ----

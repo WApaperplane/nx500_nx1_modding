@@ -24,6 +24,10 @@ backup_original/
 .uploads/
 .workbuddy/
 
+# ===== 胶片仿真探索(独立仓库 nx500-filmsim, 含 ARM 交叉编译产物) =====
+test_server/filmsim/
+*.arm
+
 # ===== 编辑器 / 系统 =====
 .DS_Store
 Thumbs.db
