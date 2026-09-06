@@ -23,6 +23,9 @@ chmod +x "$CGI_TARGET"
 # dirlist: DCIM 实时目录列表 CGI(80 端口 daemon 目录快照滞后,新照片不出现)
 cp -f "$SELF/dirlist-cgi" "$CGI_DIR/dirlist"
 chmod +x "$CGI_DIR/dirlist"
+# prewarm: 缩略图预热进度查询/控制(前端显示"已缓存 N/M")
+cp -f "$SELF/prewarm-cgi" "$CGI_DIR/prewarm"
+chmod +x "$CGI_DIR/prewarm"
 
 # 可选:确保 8080 httpd 运行(依赖 capdtm 模块)
 if [ "$1" = "start" ] && [ -x "$NX_KS/nx-rc/capdtm/capdtm-httpd.sh" ]; then

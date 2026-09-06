@@ -22,13 +22,31 @@ Gallery.MEDIA_EXTS = {
     '.3gp': 'video', '.m4v': 'video', '.webm': 'video'
 };
 
-/* 缩略图服务配置(相机端 thumb CGI,端口与 capdtm httpd 一致) */
+/* 缩略图服务配置(相机端 thumb CGI,端口与 capdtm httpd 一致)
+ *
+ * 双尺寸(2026-09-06):
+ *   grid = 网格缩略图,手机 3 列约 130px/格,320px 在 2x 屏上足够清晰,
+ *          单张约 25-30KB;预热脚本会提前铺满,命中缓存 0.2s 出图。
+ *   full = 灯箱全屏查看,1024px/q85 约 150-250KB,比直接拉 4-8MB 原图
+ *          快一个数量级;需要打印/细看时再点"原图"按钮单独加载。
+ */
 Gallery.THUMB = {
     enabled: true,   // 相机端已部署 thumb CGI 时保持 true;未部署可置 false 退回原图
     port: 8080,      // busybox httpd 端口(与 capdtm-httpd.sh 一致)
-    width: 400,      // 缩略图长边像素(网格 140px@2x DPR 足够)
-    quality: 82
+    grid: {
+        width: 320,  // 网格缩略图长边(与 thumb-prewarm.sh 的第一组参数一致)
+        quality: 75
+    },
+    full: {
+        width: 1024, // 灯箱大图长边(与 thumb-prewarm.sh 的第二组参数一致)
+        quality: 85
+    }
 };
+
+/* 网格缩略图加载失败后的重试次数(带 cache-buster)。
+ * 相机端冷生成偶发返回空 body,重试一次即可命中刚写好的缓存。
+ * 超过次数才回退原图 —— 原图 4-8MB,手机上代价远大于一次重试。 */
+Gallery.THUMB_RETRY = 1;
 
 /* 同时发起的缩略图请求上限。
  *
@@ -589,6 +607,7 @@ Gallery.prototype.startRender = function () {
 
     self.initObserver();
     self.initLightbox();
+    self.startPrewarmPoll();
 };
 
 /* 构建单个网格项(图片不设 src,由 IO 按视口加载/释放) */
@@ -603,7 +622,7 @@ Gallery.prototype.buildItem = function (item) {
         $item.append('<div class="gallery-video-thumb"></div>');
         $item.append('<span class="gallery-video-icon">&#9654;</span>');
     } else {
-        var thumb = self.thumbUrl(file);
+        var thumb = self.thumbUrl(file, 'grid');
         var $img = $('<img alt="" decoding="async" />')
             .attr('data-src', thumb)
             .attr('data-orig', file.url);
@@ -613,6 +632,15 @@ Gallery.prototype.buildItem = function (item) {
         }
         $img.on('error', function () {
             var $i = $(this);
+            var n = $i.data('retry') || 0;
+            if (n < Gallery.THUMB_RETRY) {
+                // 相机端冷生成时偶发返回空 body(convert 还没写完 CGI 就收尾),
+                // 此时缓存其实已经生成好,重试一次基本必中 —— 不要动辄回退
+                // 到 4-8MB 原图,手机上代价太大。
+                $i.data('retry', n + 1);
+                $i.attr('src', self.thumbUrl(file, 'grid', n + 1));
+                return;
+            }
             if ($i.data('fb')) {
                 // 原图也失败:显示占位
                 $i.removeAttr('src').addClass('gallery-img-fallback');
@@ -647,8 +675,10 @@ Gallery.prototype.buildItem = function (item) {
     return $item;
 };
 
-/* 缩略图 URL:相机端 thumb CGI 不可用时退回原图 */
-Gallery.prototype.thumbUrl = function (file) {
+/* 缩略图 URL:相机端 thumb CGI 不可用时退回原图
+ * size: 'grid'(默认,网格缩略图) | 'full'(灯箱大图)
+ * retry: 非 0 时附加 cache-buster,用于冷生成返回空后的重试 */
+Gallery.prototype.thumbUrl = function (file, size, retry) {
     if (!Gallery.THUMB.enabled || file.type !== 'image') {
         return file.url;
     }
@@ -662,9 +692,14 @@ Gallery.prototype.thumbUrl = function (file) {
     if (!rel) {
         return file.url;
     }
-    return 'http://' + u.hostname + ':' + Gallery.THUMB.port +
+    var cfg = (size === 'full') ? Gallery.THUMB.full : Gallery.THUMB.grid;
+    var url = 'http://' + u.hostname + ':' + Gallery.THUMB.port +
            '/cgi-bin/thumb?f=' + encodeURIComponent(rel) +
-           '&w=' + Gallery.THUMB.width + '&q=' + Gallery.THUMB.quality;
+           '&w=' + cfg.width + '&q=' + cfg.quality;
+    if (retry) {
+        url += '&_r=' + retry;
+    }
+    return url;
 };
 
 /* 视口观察:进入视口加载 src,滚出视口清空 src 释放解码内存 */
@@ -778,11 +813,73 @@ Gallery.prototype.removeObserver = function () {
     }
 };
 
+/* ============ 缩略图预热进度 ============ */
+
+/* 相机端 thumb-prewarm.sh 在 web 遥控开启时后台铺缓存(单核 ARM 上
+ * 0.5-2s/张)。没有提示时用户只能对着空白网格干等,以为是卡住了 ——
+ * 这里把后台进度显示成"预热中 87/149",并在结束后自动停止轮询
+ * (不白占相机 CPU 和 WiFi 带宽)。 */
+Gallery.PREWARM_INTERVAL = 4000;   // 轮询间隔(ms)
+Gallery.PREWARM_MAX_POLL = 90;     // 最多查 90 次(约 6 分钟)后放弃
+
+Gallery.prototype.startPrewarmPoll = function () {
+    var self = this;
+    self.stopPrewarmPoll();
+    var n = 0;
+    var tick = function () {
+        n++;
+        var url = 'http://' + app.hostname + ':' + Gallery.THUMB.port +
+                  '/cgi-bin/prewarm';
+        $.ajax({url: url, dataType: 'json', cache: false, timeout: 5000})
+            .done(function (d) {
+                var $p = $('.gallery-prewarm');
+                if (!$p.length) {
+                    self.stopPrewarmPoll();
+                    return;
+                }
+                if (!d || !d.total) {
+                    $p.text('');
+                    // 还没有进度数据:预热可能尚未启动或 CGI 未部署,
+                    // 连试 3 次仍无数据就放弃,不做无谓轮询
+                    if (n >= 3) {
+                        self.stopPrewarmPoll();
+                    }
+                    return;
+                }
+                var cached = d.done + d.skipped;
+                $p.text(d.running ? ('预热中 ' + cached + '/' + d.total)
+                                  : ('已缓存 ' + cached + '/' + d.total));
+                if (!d.running || n >= Gallery.PREWARM_MAX_POLL) {
+                    self.stopPrewarmPoll();
+                }
+            })
+            .fail(function () {
+                // CGI 未部署(旧版相机端):静默放弃,不影响相册使用
+                if (n >= 3) {
+                    self.stopPrewarmPoll();
+                }
+            });
+    };
+    tick();
+    self._prewarmTimer = setInterval(tick, Gallery.PREWARM_INTERVAL);
+};
+
+Gallery.prototype.stopPrewarmPoll = function () {
+    if (this._prewarmTimer) {
+        clearInterval(this._prewarmTimer);
+        this._prewarmTimer = null;
+    }
+};
+
 /* 顶部工具条 */
 Gallery.prototype.buildToolbar = function () {
     var self = this;
     var $bar = $('<div class="gallery-toolbar"></div>');
     $bar.append($('<span class="gallery-count"></span>').text('共 ' + self.media.length + ' 个文件'));
+    // 预热进度:后台在铺缩略图缓存时显示"预热 87/149",让用户知道在忙,
+    // 而不是对着空白网格以为卡住了
+    var $prewarm = $('<span class="gallery-prewarm"></span>');
+    $bar.append($prewarm);
     var $refresh = $('<button type="button" class="btn btn-xs btn-default">刷新</button>')
         .on('click', function () {
             // 必须带 force:否则 2 分钟 TTL 内命中目录树缓存,
@@ -992,6 +1089,7 @@ Gallery.prototype.initLightbox = function () {
     var $lb = $('<div id="galleryLightbox" class="gallery-lightbox"></div>');
     $lb.append('<div class="gallery-lb-toolbar">' +
                '<span class="gallery-lb-counter"></span>' +
+               '<button type="button" class="gallery-lb-orig" title="加载原始尺寸(4-8MB,较慢)" style="display:none;">查看原图</button>' +
                '<button type="button" class="gallery-lb-dl" title="下载当前文件">' +
                '<i class="fa fa-download"></i></button>' +
                '<button type="button" class="gallery-lb-close" title="关闭 (Esc)">&times;</button>' +
@@ -1010,6 +1108,18 @@ Gallery.prototype.initLightbox = function () {
     // 关闭
     $lb.find('.gallery-lb-close').on('click', function () {
         self.closeLightbox();
+    });
+    // 查看原图:灯箱默认显示 1024px 大图,需要细看/保存时再拉原图
+    $lb.find('.gallery-lb-orig').on('click', function () {
+        var file = self.media[self.current];
+        if (!file || file.type !== 'image') {
+            return;
+        }
+        var $o = $(this);
+        var $img = $lb.find('.gallery-lb-image');
+        $o.prop('disabled', true).text('加载中...');
+        $lb.find('.gallery-lb-spinner').show();
+        $img.data('fb', true).attr('src', file.url);
     });
     // 下载当前文件
     $lb.find('.gallery-lb-dl').on('click', function () {
@@ -1131,25 +1241,41 @@ Gallery.prototype.updateLightbox = function () {
     } else {
         $spinner.show();
         $img.off('.lb');
+        $img.data('fb', false);   // 是否已回退到原图
         $img.on('load.lb', function () {
             $spinner.hide();
             $img.fadeIn(120);
+            var $origBtn = $lb.find('.gallery-lb-orig');
+            // 非原图时才显示"原图"入口(已是原图就不必再点)
+            if ($img.data('fb')) {
+                $origBtn.hide();
+            } else {
+                $origBtn.show().prop('disabled', false).text('查看原图');
+            }
         });
         $img.on('error.lb', function () {
+            if (!$img.data('fb')) {
+                // 灯箱大图失败(未预热/生成失败):回退原图再试一次
+                $img.data('fb', true);
+                $img.attr('src', file.url);
+                return;
+            }
             $spinner.hide();
             $img.attr('src', '');
             $counter.text($counter.text() + ' (加载失败)');
         });
-        $img.attr('src', file.url).hide();
+        // 灯箱优先用 1024px 大图(150-250KB),比 4-8MB 原图快一个数量级;
+        // 需要细看/保存时再点"原图"按钮单独加载。
+        $img.attr('src', self.thumbUrl(file, 'full')).hide();
     }
 
-    // 预加载相邻图片
+    // 预加载相邻图片(同样用大图,不再预拉原图:手机上省一个数量级流量)
     if (file.type === 'image') {
         if (self.current - 1 >= 0 && self.media[self.current - 1].type === 'image') {
-            new Image().src = self.media[self.current - 1].url;
+            new Image().src = self.thumbUrl(self.media[self.current - 1], 'full');
         }
         if (self.current + 1 < self.media.length && self.media[self.current + 1].type === 'image') {
-            new Image().src = self.media[self.current + 1].url;
+            new Image().src = self.thumbUrl(self.media[self.current + 1], 'full');
         }
     }
 };

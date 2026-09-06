@@ -440,6 +440,16 @@ a { color: var(--blue); }
   line-height: 24px;
   color: var(--text-dim);
 }
+/* 预热进度:后台在铺缩略图缓存时显示"预热中 87/149" */
+.gallery-toolbar .gallery-prewarm {
+  float: left;
+  margin-left: 12px;
+  font-size: 12px;
+  line-height: 24px;
+  color: var(--text-dim);
+  opacity: 0.8;
+}
+.gallery-toolbar .gallery-prewarm:empty { margin-left: 0; }
 .gallery-toolbar .btn { margin-left: 6px; }
 
 .gallery-section { padding: 8px 8px 0 8px; }
@@ -511,8 +521,10 @@ a { color: var(--blue); }
   padding: 3px;
   box-sizing: border-box;
 }
+/* 手机为主:窄屏保持 3 列(原 480px 以下退成 2 列,一屏只看得到 4-6 张)。
+ * 网格缩略图是 320px,3 列在 2x/3x 屏上依然清晰。 */
 @media (max-width: 768px) { .gallery-item { width: 33.3333%; } }
-@media (max-width: 480px) { .gallery-item { width: 50%; } }
+@media (max-width: 480px) { .gallery-item { width: 33.3333%; } }
 .gallery-item img,
 .gallery-item .gallery-video-thumb {
   width: 100%;
@@ -527,6 +539,11 @@ a { color: var(--blue); }
 @media (max-width: 768px) {
   .gallery-item img,
   .gallery-item .gallery-video-thumb { height: 110px; }
+}
+@media (max-width: 480px) {
+  /* 3 列时格子变窄,高度同步收一点,保持接近 1:1 的观感 */
+  .gallery-item img,
+  .gallery-item .gallery-video-thumb { height: 88px; }
 }
 .gallery-item img:hover { opacity: 0.85; }
 .gallery-item img.gallery-img-fallback {

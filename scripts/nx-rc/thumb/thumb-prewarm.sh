@@ -12,25 +12,32 @@
 #   浏览时全部命中缓存 -> 秒开,CPU 也不再有尖峰。
 #
 # 用法(相机端):
-#   thumb-prewarm.sh start [宽度] [质量] [最多张数]   # 后台开始预热
-#   thumb-prewarm.sh stop                            # 停止
-#   thumb-prewarm.sh status                          # 查看进度
+#   thumb-prewarm.sh start [宽] [质量] [最多张数] [大图宽] [大图质量] [大图张数]
+#   thumb-prewarm.sh stop
+#   thumb-prewarm.sh status            # 人类可读
+#   thumb-prewarm.sh json              # JSON(供 prewarm CGI / 前端进度条读取)
 #
 # 例:
-#   thumb-prewarm.sh start 400 82 300   # 预热最新 300 张,400px/q82
-#   thumb-prewarm.sh start              # 默认 400 82 200
+#   thumb-prewarm.sh start 320 75 300 1024 85 60
+#     -> 最新 300 张生成 320px/q75(网格),其中最新 60 张再生成 1024px/q85(灯箱)
+#   thumb-prewarm.sh start             # 默认 320 75 200 1024 85 40
 #
-# 开机自启(写到 auto/a_init.sh 末尾):
-#   /opt/usr/nx-ks/nx-rc/thumb/thumb-prewarm.sh start &
+# 接线(nx-rc.sh 中,web 遥控开启时自动拉起):
+#   [ -x "$APP_PATH/thumb/thumb-prewarm.sh" ] && "$APP_PATH/thumb/thumb-prewarm.sh" start >/dev/null 2>&1 &
+#
+# 进度: /tmp/thumb_prewarm.progress (JSON),前端经 8080 cgi-bin/prewarm 读取
 # ============================================================
 
-TOOLS=/opt/usr/nx-ks/tools
+# 注意:相机端实际布局是 /opt/usr/nx-ks/nx-rc/tools (install.sh 是
+# cp -ar scripts/* -> /opt/usr/nx-ks/,脚本内引用必须带 nx-rc 层)。
+TOOLS=/opt/usr/nx-ks/nx-rc/tools
 CONVERT=$TOOLS/usr/bin/convert
 LD_LIBRARY_PATH=$TOOLS/usr/lib
 export LD_LIBRARY_PATH
 
 PIDFILE=/tmp/thumb_prewarm.pid
 LOGFILE=/tmp/thumb_prewarm.log
+PROGRESS=/tmp/thumb_prewarm.progress
 
 # ---- 定位 SD 卡 ----
 SD=""
@@ -43,6 +50,14 @@ done
 
 log() {
     echo "$(date '+%H:%M:%S') $1" >> "$LOGFILE"
+}
+
+# 写进度 JSON: $1=状态 $2=已生成 $3=已跳过 $4=总数
+write_progress() {
+    printf '{"running":%s,"w":%s,"q":%s,"fw":%s,"fq":%s,"done":%s,"skipped":%s,"total":%s,"ts":%s}\n' \
+        "$1" "$W" "$Q" "$FW" "$FQ" "$2" "$3" "$4" "$(date +%s)" \
+        > "$PROGRESS.tmp" 2>/dev/null
+    mv -f "$PROGRESS.tmp" "$PROGRESS" 2>/dev/null
 }
 
 case "$1" in
@@ -61,16 +76,34 @@ case "$1" in
         else
             echo "not running"
         fi
+        echo "--- progress ---"
+        cat "$PROGRESS" 2>/dev/null
         echo "--- last log ---"
         tail -5 "$LOGFILE" 2>/dev/null
+        exit 0
+        ;;
+    json)
+        # 供 CGI 读取:进程不在时把 running 置 0
+        if [ -f "$PROGRESS" ]; then
+            if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+                cat "$PROGRESS"
+            else
+                sed 's/"running":1/"running":0/' "$PROGRESS"
+            fi
+        else
+            echo '{"running":0,"done":0,"skipped":0,"total":0}'
+        fi
         exit 0
         ;;
 esac
 
 # ---- start ----
-W=${2:-400}
-Q=${3:-82}
+W=${2:-320}
+Q=${3:-75}
 LIMIT=${4:-200}
+FW=${5:-1024}
+FQ=${6:-85}
+FLIMIT=${7:-40}
 
 [ -d "$SD/DCIM" ] || { echo "SD card / DCIM not found"; exit 1; }
 [ -x "$CONVERT" ] || { echo "convert not found: $CONVERT"; exit 1; }
@@ -81,14 +114,56 @@ if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
 fi
 
 : > "$LOGFILE"
-log "start: w=$W q=$Q limit=$LIMIT"
+log "start: w=$W q=$Q limit=$LIMIT  full: w=$FW q=$FQ limit=$FLIMIT"
+
+# 统计图片总数(轻量 ls,只读目录项),供前端算进度百分比
+TOTAL=0
+for d in $(ls -1 "$SD/DCIM" 2>/dev/null); do
+    DD="$SD/DCIM/$d"
+    [ -d "$DD" ] || continue
+    for f in $(ls -1 "$DD" 2>/dev/null); do
+        case "$f" in
+            *.JPG|*.jpg|*.JPEG|*.jpeg|*.PNG|*.png) TOTAL=$((TOTAL + 1)) ;;
+        esac
+    done
+done
+write_progress 1 0 0 "$TOTAL"
 
 # 后台执行
 (
     echo $$ > "$PIDFILE"
     CACHE_ROOT="$SD/.thumbcache/${W}x${Q}"
+    FULL_ROOT="$SD/.thumbcache/${FW}x${FQ}"
     DONE=0
     SKIP=0
+
+    # 生成一张: $1=源 $2=缓存根 $3=宽 $4=质量 $5=相对路径(无扩展名)
+    gen_one() {
+        src=$1; root=$2; w=$3; q=$4; rel=$5
+        cache="$root/$rel.jpg"
+        if [ -f "$cache" ] && [ ! "$src" -nt "$cache" ]; then
+            return 1
+        fi
+        mkdir -p "$(dirname "$cache")" 2>/dev/null
+        tmp="$cache.tmp.$$"
+        rm -f "$tmp"
+        # nice -n 19:让位给拍摄/遥控,避免抢占 CPU
+        if command -v nice >/dev/null 2>&1; then
+            nice -n 19 "$CONVERT" -define "jpeg:size=${w}x${w}" \
+                -auto-orient -thumbnail "${w}x${w}" -quality "$q" \
+                "$src" "$tmp" 2>/dev/null
+        else
+            "$CONVERT" -define "jpeg:size=${w}x${w}" \
+                -auto-orient -thumbnail "${w}x${w}" -quality "$q" \
+                "$src" "$tmp" 2>/dev/null
+        fi
+        if [ -s "$tmp" ]; then
+            mv -f "$tmp" "$cache" 2>/dev/null || rm -f "$tmp"
+            return 0
+        fi
+        rm -f "$tmp"
+        return 2
+    }
 
     # 目录倒序 + 目录内文件名倒序 = 最新照片优先预热
     for d in $(ls -1r "$SD/DCIM" 2>/dev/null); do
@@ -104,38 +179,26 @@ log "start: w=$W q=$Q limit=$LIMIT"
             SRC="$DD/$f"
             [ -f "$SRC" ] || continue
             REL="$d/${f%.*}"
-            CACHE="$CACHE_ROOT/$REL.jpg"
 
-            # 已缓存且未过期则跳过
-            if [ -f "$CACHE" ] && [ ! "$SRC" -nt "$CACHE" ]; then
+            gen_one "$SRC" "$CACHE_ROOT" "$W" "$Q" "$REL"
+            rc=$?
+            if [ "$rc" -eq 1 ]; then
                 SKIP=$((SKIP + 1))
-                continue
-            fi
-
-            mkdir -p "$(dirname "$CACHE")" 2>/dev/null
-            TMP="$CACHE.tmp.$$"
-            rm -f "$TMP"
-            # nice -n 19:让位给拍摄/遥控,避免抢占 CPU
-            if command -v nice >/dev/null 2>&1; then
-                nice -n 19 "$CONVERT" -define "jpeg:size=${W}x${W}" \
-                    -auto-orient -thumbnail "${W}x${W}" -quality "$Q" \
-                    "$SRC" "$TMP" 2>/dev/null
             else
-                "$CONVERT" -define "jpeg:size=${W}x${W}" \
-                    -auto-orient -thumbnail "${W}x${W}" -quality "$Q" \
-                    "$SRC" "$TMP" 2>/dev/null
-            fi
-            if [ -s "$TMP" ]; then
-                mv -f "$TMP" "$CACHE" 2>/dev/null || rm -f "$TMP"
                 DONE=$((DONE + 1))
-                [ $((DONE % 20)) -eq 0 ] && log "generated $DONE (skipped $SKIP)"
-            else
-                rm -f "$TMP"
+                # 最新若干张额外预热灯箱大图(全屏查看才需要)
+                if [ "$DONE" -le "$FLIMIT" ]; then
+                    gen_one "$SRC" "$FULL_ROOT" "$FW" "$FQ" "$REL"
+                fi
             fi
+            # 每 5 张更新一次进度文件(写 /tmp 很便宜,前端看着平滑)
+            [ $((DONE % 5)) -eq 0 ] && write_progress 1 "$DONE" "$SKIP" "$TOTAL"
+            [ $((DONE % 20)) -eq 0 ] && log "generated $DONE (skipped $SKIP)"
         done
     done
 
-    log "finished: generated=$DONE skipped=$SKIP"
+    write_progress 0 "$DONE" "$SKIP" "$TOTAL"
+    log "finished: generated=$DONE skipped=$SKIP total=$TOTAL"
     rm -f "$PIDFILE"
 ) >> "$LOGFILE" 2>&1 &
 
