@@ -12,10 +12,28 @@ Samsung NX500 / NX1 (Tizen / DRIMe5) 增强固件 mod —— 基于社区
 
 - Web 遥控 (`nx-rc`) 网页相册：**折叠目录模型** —— 目录倒序、默认只展开最新目录、
   按需加载 + 缩略图缓存，根治单核 CPU 上目录多导致的首屏卡顿。
+- 相册**实时目录源**：8080 端口 `dirlist` CGI 每次请求直接 readdir SD 卡，
+  新拍照片立即可见（80 端口 daemon 的目录列表是启动快照，新照片永不出现）。
+- **缩略图预热**：开启遥控后台自动铺缓存（网格 320px 最新 300 张 + 灯箱 1024px
+  最新 60 张，`nice -n 19` 不影响拍摄），前端显示预热进度；加载失败自动重试。
+- **主菜单直显 IP + 一键 Telnet/FTP**：每次打开菜单动态生成，最后一行显示
+  当前 IP 与 Telnet 状态，点击即开关（替代 EV+WiFi 组合键）；不再反复弹 IP 弹窗。
 - 相机端缩略图 CGI（ImageMagick DCT 缩放 + SD 缓存 + `nice` 降权），前端心跳去抖 +
   并发限流，WiFi 假断开根治。
+- **8080 服务群**（busybox httpd）：`thumb`(缩略图) / `dirlist`(实时目录) /
+  `prewarm`(预热进度) / `push`(WiFi 在线推送前端，免拔卡)。
 - 拍摄参数 Web API（`capdtm`）、键位/码率/黑场等原 NX-KS 模块保留。
 - 全新**同步链路**：SD 卡"智能引导器"插卡即增量同步（永不误卸载）+ WiFi 在线 push。
+
+## 相机菜单速查 / Camera menu
+
+| 菜单项 | 作用 |
+|---|---|
+| `IP: x.x.x.x [Telnet关]` | 显示当前 WiFi IP；**点击 = 开/关 Telnet(23) + FTP(21)**，popup 反馈 |
+| `远程控制` (checkbox) | 开关 Web 遥控（80 端口），同时拉起 8080 服务群与缩略图预热 |
+
+菜单每次打开时重新生成（`gen_menu.sh`），IP / Telnet 状态始终最新。
+PC 端排障工具：`test_server/telnet_run.py <相机IP> '命令'`（非交互 telnet，root 空密码）。
 
 ## 快速开始 / Quick start
 
