@@ -34,7 +34,15 @@ fi
 
 case "$ACTION" in
     start)
-        "$PREWARM" start >/dev/null 2>&1
+        # 注意:CGI 请求结束时 busybox httpd 会清理整个进程组,直接 & 启动的
+        # 预热会被连坐杀掉(running 立刻变 0)。必须用 setsid 脱离会话,
+        # 没有 setsid 时退化为 nohup。
+        if command -v setsid >/dev/null 2>&1; then
+            setsid "$PREWARM" start >/dev/null 2>&1 &
+        else
+            nohup "$PREWARM" start >/dev/null 2>&1 &
+        fi
+        sleep 1
         ;;
     stop)
         "$PREWARM" stop >/dev/null 2>&1

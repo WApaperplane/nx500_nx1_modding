@@ -40,12 +40,28 @@ LOGFILE=/tmp/thumb_prewarm.log
 PROGRESS=/tmp/thumb_prewarm.progress
 
 # ---- 定位 SD 卡 ----
+# web 遥控刚开启时 nx-rc.sh 会立刻拉起本脚本,而 SD 卡挂载可能还没完成,
+# 此时 [ -d "$SD/DCIM" ] 会失败导致预热静默退出(进度文件都不会生成)。
+# 这里最多等 SD_WAIT 秒,等 DCIM 出现再继续。
+SD_WAIT=${SD_WAIT:-30}
+sd_ready() {
+    for cand in /mnt/mmc /tmp/mmc /mnt/sd /tmp/sd; do
+        if [ -d "$cand/DCIM" ]; then
+            SD=$cand
+            return 0
+        fi
+    done
+    return 1
+}
+
 SD=""
-for cand in /mnt/mmc /tmp/mmc /mnt/sd /tmp/sd; do
-    if [ -d "$cand/DCIM" ]; then
-        SD=$cand
+i=0
+while [ "$i" -lt "$SD_WAIT" ]; do
+    if sd_ready; then
         break
     fi
+    i=$((i + 1))
+    sleep 1
 done
 
 log() {
