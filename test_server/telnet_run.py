@@ -5,12 +5,15 @@
 用法: python telnet_run.py '命令1' '命令2' ...
 登录: 自动发 root;密码从环境变量 NX_TELNET_PWD 读取(默认空)
 """
-import socket, sys, time, os
+import socket, sys, time, os, re
 
-HOST, PORT = "192.168.0.103", 23
+HOST, PORT = os.environ.get("NX_TELNET_HOST", "192.168.0.103"), 23
+# 第一个参数若是 IP 则作为目标主机(相机 DHCP 后 IP 会变)
 cmds = sys.argv[1:]
+if cmds and re.match(r'^\d+\.\d+\.\d+\.\d+$', cmds[0]):
+    HOST = cmds.pop(0)
 if not cmds:
-    print("用法: python telnet_run.py '命令1' '命令2' ...")
+    print("用法: python telnet_run.py [IP] '命令1' '命令2' ...")
     sys.exit(1)
 
 s = socket.create_connection((HOST, PORT), timeout=8)
